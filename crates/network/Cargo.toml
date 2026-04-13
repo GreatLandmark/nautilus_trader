@@ -64,6 +64,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
+tokio-socks = "0.5"
 tokio-util = { workspace = true }
 url = { workspace = true }
 ustr = { workspace = true }

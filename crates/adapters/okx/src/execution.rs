@@ -44,7 +44,9 @@ use nautilus_core::{
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{AccountType, OmsType, OrderSide, OrderType, TimeInForce, TrailingOffsetType},
+    enums::{
+        AccountType, OmsType, OrderSide, OrderType, PositionSide, TimeInForce, TrailingOffsetType,
+    },
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue, VenueOrderId,
     },
@@ -85,6 +87,24 @@ fn get_param_as_string(params: &Option<Params>, key: &str) -> Option<String> {
                 .or_else(|| v.as_f64().map(|n| n.to_string()))
         })
     })
+}
+
+fn get_param_as_position_side(params: &Option<Params>, key: &str) -> Option<PositionSide> {
+    let value = get_param_as_string(params, key)?;
+    match value.to_ascii_lowercase().as_str() {
+        "long" => Some(PositionSide::Long),
+        "short" => Some(PositionSide::Short),
+        "net" => Some(PositionSide::Flat),
+        other => {
+            log::warn!("Invalid {key} '{other}', expected one of: long, short, net");
+            None
+        }
+    }
+}
+
+fn position_side_for_order(params: &Option<Params>) -> Option<PositionSide> {
+    get_param_as_position_side(params, "pos_side")
+        .or_else(|| get_param_as_position_side(params, "position_side"))
 }
 
 #[derive(Debug)]
@@ -290,6 +310,7 @@ impl OKXExecutionClient {
 
         let px_usd = get_param_as_string(&cmd.params, "px_usd");
         let px_vol = get_param_as_string(&cmd.params, "px_vol");
+        let position_side = position_side_for_order(&cmd.params);
 
         self.spawn_task("submit_order", async move {
             let result = ws_private
@@ -308,7 +329,7 @@ impl OKXExecutionClient {
                     Some(is_post_only),
                     Some(is_reduce_only),
                     Some(is_quote_quantity),
-                    None,
+                    position_side,
                     None,
                     px_usd,
                     px_vol,

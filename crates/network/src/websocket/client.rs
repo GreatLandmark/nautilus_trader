@@ -26,6 +26,7 @@
 use std::{
     collections::VecDeque,
     fmt::Debug,
+    io,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -37,15 +38,15 @@ use futures_util::{SinkExt, StreamExt};
 use http::HeaderName;
 use nautilus_core::CleanDrop;
 use nautilus_cryptography::providers::install_cryptographic_provider;
-#[cfg(feature = "turmoil")]
-use tokio_tungstenite::MaybeTlsStream;
-#[cfg(feature = "turmoil")]
-use tokio_tungstenite::client_async;
 #[cfg(not(feature = "turmoil"))]
-use tokio_tungstenite::connect_async_with_config;
+use tokio_socks::tcp::Socks5Stream;
 use tokio_tungstenite::tungstenite::{
     Error, Message, client::IntoClientRequest, http::HeaderValue,
 };
+#[cfg(feature = "turmoil")]
+use tokio_tungstenite::{MaybeTlsStream, client_async};
+#[cfg(not(feature = "turmoil"))]
+use tokio_tungstenite::{MaybeTlsStream, client_async_with_config, connect_async_with_config};
 use ustr::Ustr;
 
 use super::{
@@ -230,8 +231,12 @@ impl WebSocketClientInner {
         let is_stream_mode = message_handler.is_none();
         let reconnect_max_attempts = config.reconnect_max_attempts;
 
-        let (writer, reader) =
-            Self::connect_with_server(&config.url, config.headers.clone()).await?;
+        let (writer, reader) = Self::connect_with_server(
+            &config.url,
+            config.headers.clone(),
+            config.proxy_url.as_deref(),
+        )
+        .await?;
 
         let connection_mode = Arc::new(AtomicU8::new(ConnectionMode::Active.as_u8()));
         let state_notify = Arc::new(tokio::sync::Notify::new());
@@ -318,6 +323,7 @@ impl WebSocketClientInner {
     pub async fn connect_with_server(
         url: &str,
         headers: Vec<(String, String)>,
+        proxy_url: Option<&str>,
     ) -> Result<(MessageWriter, MessageReader), Error> {
         let mut request = url.into_client_request()?;
         let req_headers = request.headers_mut();
@@ -331,9 +337,100 @@ impl WebSocketClientInner {
             req_headers.insert(header_name, header_value);
         }
 
-        connect_async_with_config(request, None, true)
+        match proxy_url {
+            Some(proxy_url) => {
+                let ws_url = url::Url::parse(url).map_err(|e| {
+                    Error::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid websocket URL '{url}': {e}"),
+                    ))
+                })?;
+                let proxy = url::Url::parse(proxy_url).map_err(|e| {
+                    Error::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid proxy URL '{proxy_url}': {e}"),
+                    ))
+                })?;
+                let stream = Self::connect_via_socks5(&ws_url, &proxy).await?;
+                client_async_with_config(request, stream, None)
+                    .await
+                    .map(|resp| resp.0.split())
+            }
+            None => connect_async_with_config(request, None, true)
+                .await
+                .map(|resp| resp.0.split()),
+        }
+    }
+
+    #[cfg(not(feature = "turmoil"))]
+    async fn connect_via_socks5(
+        ws_url: &url::Url,
+        proxy_url: &url::Url,
+    ) -> Result<MaybeTlsStream<tokio::net::TcpStream>, Error> {
+        if !proxy_url.scheme().eq_ignore_ascii_case("socks5") {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unsupported websocket proxy scheme '{}', only socks5 is supported",
+                    proxy_url.scheme()
+                ),
+            )));
+        }
+
+        let proxy_host = proxy_url.host_str().ok_or_else(|| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SOCKS5 proxy URL missing host",
+            ))
+        })?;
+        let proxy_port = proxy_url.port_or_known_default().ok_or_else(|| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SOCKS5 proxy URL missing port",
+            ))
+        })?;
+
+        let target_host = ws_url
+            .host_str()
+            .ok_or_else(|| {
+                Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "WebSocket URL missing host",
+                ))
+            })?
+            .to_string();
+        let target_port = ws_url.port_or_known_default().ok_or_else(|| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WebSocket URL missing port",
+            ))
+        })?;
+
+        let proxy_addr = format!("{proxy_host}:{proxy_port}");
+        let target_addr = (target_host.as_str(), target_port);
+        let tcp = match (proxy_url.username().is_empty(), proxy_url.password()) {
+            (false, password) => Socks5Stream::connect_with_password(
+                proxy_addr.as_str(),
+                target_addr,
+                proxy_url.username(),
+                password.unwrap_or_default(),
+            )
             .await
-            .map(|resp| resp.0.split())
+            .map_err(|e| Error::Io(io::Error::other(e.to_string())))?
+            .into_inner(),
+            _ => Socks5Stream::connect(proxy_addr.as_str(), target_addr)
+                .await
+                .map_err(|e| Error::Io(io::Error::other(e.to_string())))?
+                .into_inner(),
+        };
+
+        if ws_url.scheme().eq_ignore_ascii_case("wss") {
+            let mode = tokio_tungstenite::tungstenite::stream::Mode::Tls;
+            let request = ws_url.as_str().into_client_request()?;
+            crate::tls::tcp_tls(&request, mode, tcp, None).await
+        } else {
+            Ok(MaybeTlsStream::Plain(tcp))
+        }
     }
 
     /// Connects with the server creating a tokio-tungstenite websocket stream.
@@ -455,8 +552,12 @@ impl WebSocketClientInner {
 
         tokio::time::timeout(self.reconnect_timeout, async {
             // Attempt to connect; abort early if a disconnect was requested
-            let (new_writer, reader) =
-                Self::connect_with_server(&self.config.url, self.config.headers.clone()).await?;
+            let (new_writer, reader) = Self::connect_with_server(
+                &self.config.url,
+                self.config.headers.clone(),
+                self.config.proxy_url.as_deref(),
+            )
+            .await?;
 
             if ConnectionMode::from_atomic(&self.connection_mode).is_disconnect() {
                 log::debug!("Reconnect aborted mid-flight (after connect)");
@@ -1023,8 +1124,12 @@ impl WebSocketClient {
         install_cryptographic_provider();
 
         // Create a single connection and split it, respecting configured headers
-        let (writer, reader) =
-            WebSocketClientInner::connect_with_server(&config.url, config.headers.clone()).await?;
+        let (writer, reader) = WebSocketClientInner::connect_with_server(
+            &config.url,
+            config.headers.clone(),
+            config.proxy_url.as_deref(),
+        )
+        .await?;
 
         // Create inner without connecting (we'll provide the writer)
         let inner = WebSocketClientInner::new_with_writer(config, writer).await?;

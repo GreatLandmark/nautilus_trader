@@ -329,6 +329,17 @@ impl OKXWebSocketClient {
         )
     }
 
+    fn ws_proxy_url_from_env() -> Option<String> {
+        std::env::var("ALL_PROXY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                std::env::var("all_proxy")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+    }
+
     /// Cancel all pending WebSocket requests.
     pub fn cancel_all_requests(&self) {
         self.cancellation_token.cancel();
@@ -454,8 +465,14 @@ impl OKXWebSocketClient {
             // Handler responds to pings internally via select! loop
         });
 
+        let proxy_url = Self::ws_proxy_url_from_env();
+        if let Some(proxy_url) = proxy_url.as_deref() {
+            log::info!("Using WebSocket proxy from ALL_PROXY: {proxy_url}");
+        }
+
         let config = WebSocketConfig {
             url: self.url.clone(),
+            proxy_url,
             headers: vec![(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string())],
             heartbeat: self.heartbeat,
             heartbeat_msg: Some(TEXT_PING.to_string()),

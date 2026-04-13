@@ -61,8 +61,9 @@ pub struct OKXDataClientConfig {
     pub http_proxy_url: Option<String>,
     /// Optional WebSocket proxy URL.
     ///
-    /// Note: WebSocket proxy support is not yet implemented. This field is reserved
-    /// for future functionality. Use `http_proxy_url` for REST API proxy support.
+    /// Supports SOCKS5 proxy URLs such as `socks5://127.0.0.1:7898`.
+    /// When not set explicitly, WebSocket clients may also read `ALL_PROXY`
+    /// from the environment.
     pub ws_proxy_url: Option<String>,
     /// The API environment (live or demo).
     #[builder(default)]
@@ -184,8 +185,9 @@ pub struct OKXExecClientConfig {
     pub http_proxy_url: Option<String>,
     /// Optional WebSocket proxy URL.
     ///
-    /// Note: WebSocket proxy support is not yet implemented. This field is reserved
-    /// for future functionality. Use `http_proxy_url` for REST API proxy support.
+    /// Supports SOCKS5 proxy URLs such as `socks5://127.0.0.1:7898`.
+    /// When not set explicitly, WebSocket clients may also read `ALL_PROXY`
+    /// from the environment.
     pub ws_proxy_url: Option<String>,
     /// The API environment (live or demo).
     #[builder(default)]

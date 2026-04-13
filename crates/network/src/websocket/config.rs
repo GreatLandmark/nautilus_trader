@@ -62,6 +62,10 @@ use std::fmt::Debug;
 pub struct WebSocketConfig {
     /// The URL to connect to.
     pub url: String,
+    /// Optional proxy URL for the WebSocket connection.
+    ///
+    /// Currently intended for SOCKS5 proxies such as `socks5://127.0.0.1:7898`.
+    pub proxy_url: Option<String>,
     /// The default headers.
     #[builder(default)]
     pub headers: Vec<(String, String)>,
