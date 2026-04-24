@@ -82,7 +82,8 @@ use super::{
     error::OKXHttpError,
     models::{
         OKXAccount, OKXAmendAlgoOrderRequest, OKXAmendAlgoOrderResponse, OKXAttachAlgoOrdRequest,
-        OKXCancelAlgoOrderRequest, OKXCancelAlgoOrderResponse, OKXFeeRate, OKXFundingRateHistory,
+        OKXCancelAlgoOrderRequest, OKXCancelAlgoOrderResponse, OKXCancelOrderRequest,
+        OKXCancelOrderResponse, OKXFeeRate, OKXFundingRateHistory,
         OKXIndexTicker, OKXMarkPrice, OKXOptionSummary, OKXOrderAlgo, OKXOrderBookSnapshot,
         OKXOrderHistory, OKXPlaceAlgoOrderRequest, OKXPlaceAlgoOrderResponse, OKXPlaceOrderRequest,
         OKXPlaceOrderResponse, OKXPosition, OKXPositionHistory, OKXPositionTier, OKXServerTime,
@@ -1057,6 +1058,54 @@ impl OKXRawHttpClient {
             "/api/v5/trade/orders-pending",
             Some(&params),
             None,
+            true,
+        )
+        .await
+    }
+
+    /// Cancels a single order via `POST /api/v5/trade/cancel-order`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
+    pub async fn cancel_order(
+        &self,
+        request: OKXCancelOrderRequest,
+    ) -> Result<Vec<OKXCancelOrderResponse>, OKXHttpError> {
+        let body = serde_json::to_vec(&request)
+            .map_err(|e| OKXHttpError::JsonError(e.to_string()))?;
+        self.send_request::<OKXCancelOrderResponse, ()>(
+            Method::POST,
+            "/api/v5/trade/cancel-order",
+            None,
+            Some(body),
+            true,
+        )
+        .await
+    }
+
+    /// Cancels multiple orders in a single request via `POST /api/v5/trade/cancel-batch-orders`.
+    ///
+    /// OKX accepts up to 20 items per request. The caller is responsible for splitting
+    /// larger lists into batches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
+    pub async fn cancel_batch_orders(
+        &self,
+        requests: Vec<OKXCancelOrderRequest>,
+    ) -> Result<Vec<OKXCancelOrderResponse>, OKXHttpError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = serde_json::to_vec(&requests)
+            .map_err(|e| OKXHttpError::JsonError(e.to_string()))?;
+        self.send_request::<OKXCancelOrderResponse, ()>(
+            Method::POST,
+            "/api/v5/trade/cancel-batch-orders",
+            None,
+            Some(body),
             true,
         )
         .await

@@ -116,6 +116,7 @@ impl CoreBlockchainRpcClient {
 
         let config = WebSocketConfig {
             url: self.wss_rpc_url.clone(),
+            proxy_url: None,
             headers: vec![user_agent],
             heartbeat: Some(heartbeat_interval),
             heartbeat_msg: None,

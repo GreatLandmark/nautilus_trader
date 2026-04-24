@@ -1028,6 +1028,41 @@ pub struct OKXCancelAlgoOrderResponse {
     pub s_msg: Option<String>,
 }
 
+
+/// Represents the request body for `POST /api/v5/trade/cancel-order` or
+/// `POST /api/v5/trade/cancel-batch-orders`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXCancelOrderRequest {
+    /// Instrument ID, e.g. `ETH-USDT-SWAP`.
+    pub inst_id: String,
+    /// OKX-assigned order ID. Either `ord_id` or `cl_ord_id` is required.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ord_id: Option<String>,
+    /// Client-assigned order ID. Either `ord_id` or `cl_ord_id` is required.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cl_ord_id: Option<String>,
+}
+
+/// Represents a single response item from `POST /api/v5/trade/cancel-order` or
+/// `POST /api/v5/trade/cancel-batch-orders`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXCancelOrderResponse {
+    /// OKX-assigned order ID.
+    #[serde(default)]
+    pub ord_id: String,
+    /// Client-assigned order ID (empty string if not set by user).
+    #[serde(default)]
+    pub cl_ord_id: String,
+    /// Per-item result code; `"0"` means success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s_code: Option<String>,
+    /// Per-item result message (empty on success).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s_msg: Option<String>,
+}
+
 /// Represents the request body for `POST /api/v5/trade/amend-algos` (amend algo order).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
