@@ -22,6 +22,105 @@ pub use nautilus_core::serialization::{
     deserialize_decimal_or_zero, deserialize_optional_decimal_or_zero,
     deserialize_optional_decimal_str, deserialize_string_to_u8,
 };
+
+/// Serde helper for Bybit `ON`/`OFF` string fields that represent booleans.
+///
+/// Use as `#[serde(with = "on_off_bool")]`. Unknown values deserialize as an
+/// error rather than silently coercing, so field renames surface rather than
+/// decoding to the wrong value.
+pub mod on_off_bool {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(value: &bool, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(if *value { "ON" } else { "OFF" })
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+        let raw = String::deserialize(d)?;
+        match raw.as_str() {
+            "ON" => Ok(true),
+            "OFF" => Ok(false),
+            other => Err(D::Error::custom(format!(
+                "expected 'ON' or 'OFF', received {other:?}"
+            ))),
+        }
+    }
+}
+
+/// Serde helper that accepts `readOnly` as either a bool or `0`/`1` integer.
+///
+/// Bybit returns `readOnly` as a bool on `/v5/user/list-sub-apikeys` and as an
+/// integer on `/v5/user/query-api` and the two update endpoints. Deserializing
+/// through this module keeps the Rust field a plain `bool` across all DTOs.
+pub mod bool_or_int {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(value: &bool, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bool(*value)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum BoolOrInt {
+            Bool(bool),
+            Int(i64),
+        }
+
+        match BoolOrInt::deserialize(d)? {
+            BoolOrInt::Bool(b) => Ok(b),
+            BoolOrInt::Int(0) => Ok(false),
+            BoolOrInt::Int(1) => Ok(true),
+            BoolOrInt::Int(n) => Err(D::Error::custom(format!(
+                "expected bool or 0/1, received {n}"
+            ))),
+        }
+    }
+}
+
+/// Round-trips `Option<bool>` as `0`/`1` integers for Bybit request bodies
+/// that advertise `readOnly` as an integer on the wire.
+pub mod opt_bool_as_int {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(value: &Option<bool>, s: S) -> Result<S::Ok, S::Error> {
+        value.map(i32::from).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+        match Option::<i32>::deserialize(d)? {
+            None => Ok(None),
+            Some(0) => Ok(Some(false)),
+            Some(1) => Ok(Some(true)),
+            Some(n) => Err(D::Error::custom(format!("expected 0 or 1, received {n}"))),
+        }
+    }
+}
+
+/// Serde helper that treats the masked secret literal (`"******"`) and empty
+/// strings as `None`, preserving real values as `Some`.
+///
+/// Bybit responses never expose a usable secret: `list-sub-apikeys` returns
+/// `"******"`, while the update endpoints return `""`. Surfacing `Option<String>`
+/// keeps callers from accidentally treating the sentinel as a real credential.
+pub mod masked_secret {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(v) => v.serialize(s),
+            None => "".serialize(s),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+        let raw = Option::<String>::deserialize(d)?;
+        Ok(match raw.as_deref() {
+            None | Some("" | "******") => None,
+            Some(_) => raw,
+        })
+    }
+}
 use nautilus_core::{
     Params, UUID4,
     datetime::{NANOSECONDS_IN_MILLISECOND, nanos_to_millis as nanos_to_millis_u64},
@@ -38,7 +137,7 @@ use nautilus_model::{
     },
     events::account::state::AccountState,
     identifiers::{
-        AccountId, ClientOrderId, InstrumentId, PositionId, Symbol, TradeId, Venue, VenueOrderId,
+        AccountId, ClientOrderId, InstrumentId, PositionId, Symbol, TradeId, VenueOrderId,
     },
     instruments::{
         Instrument, any::InstrumentAny, crypto_future::CryptoFuture, crypto_option::CryptoOption,
@@ -911,6 +1010,17 @@ pub fn parse_position_status_report(
         parse_millis_timestamp(&position.updated_time, "position.updatedTime")?
     };
 
+    // Bybit ranks open positions 1-5 by ADL priority (5 = next to be deleveraged);
+    // 0 means the account has no open position or is flat.
+    if position.adl_rank_indicator >= 4 {
+        log::warn!(
+            "Elevated ADL risk: {} position size={} adl_rank={}",
+            instrument_id,
+            position.size,
+            position.adl_rank_indicator,
+        );
+    }
+
     Ok(PositionStatusReport::new(
         account_id,
         instrument_id,
@@ -943,45 +1053,41 @@ pub fn parse_account_state(
         let locked_dec = coin.locked;
 
         let currency = get_currency(&coin.coin);
-        let total = Money::from_decimal(total_dec, currency)?;
-        let locked = Money::from_decimal(locked_dec, currency)?;
-        let free = Money::from_raw(total.raw - locked.raw, currency);
-
-        balances.push(AccountBalance::new(total, locked, free));
+        balances.push(AccountBalance::from_total_and_locked(
+            total_dec, locked_dec, currency,
+        )?);
     }
 
     let mut margins = Vec::new();
 
     for coin in &wallet_balance.coin {
-        let initial_margin_f64 = match &coin.total_position_im {
+        // Position IM is reserved against open positions; order IM is reserved against
+        // pending orders. Sum both so an account that only has open orders still
+        // reports a non-zero initial margin.
+        let position_im_f64 = match &coin.total_position_im {
             Some(im) if !im.is_empty() => im.parse::<f64>()?,
             _ => 0.0,
         };
+        let order_im_f64 = match &coin.total_order_im {
+            Some(im) if !im.is_empty() => im.parse::<f64>()?,
+            _ => 0.0,
+        };
+        let initial_margin_f64 = position_im_f64 + order_im_f64;
 
         let maintenance_margin_f64 = match &coin.total_position_mm {
             Some(mm) if !mm.is_empty() => mm.parse::<f64>()?,
             _ => 0.0,
         };
 
-        let currency = get_currency(&coin.coin);
-
-        // Only create margin balance if there are actual margin requirements
-        if initial_margin_f64 > 0.0 || maintenance_margin_f64 > 0.0 {
-            let initial_margin = Money::new(initial_margin_f64, currency);
-            let maintenance_margin = Money::new(maintenance_margin_f64, currency);
-
-            // Create a synthetic instrument_id for account-level margins
-            let margin_instrument_id = InstrumentId::new(
-                Symbol::from_str_unchecked(format!("ACCOUNT-{}", coin.coin)),
-                Venue::new("BYBIT"),
-            );
-
-            margins.push(MarginBalance::new(
-                initial_margin,
-                maintenance_margin,
-                margin_instrument_id,
-            ));
+        if initial_margin_f64 == 0.0 && maintenance_margin_f64 == 0.0 {
+            continue;
         }
+
+        let currency = get_currency(&coin.coin);
+        let initial_margin = Money::new(initial_margin_f64, currency);
+        let maintenance_margin = Money::new(maintenance_margin_f64, currency);
+
+        margins.push(MarginBalance::new(initial_margin, maintenance_margin, None));
     }
 
     let account_type = AccountType::Margin;

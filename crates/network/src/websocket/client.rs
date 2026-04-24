@@ -63,6 +63,7 @@ use crate::net::TcpConnector;
 use crate::{
     RECONNECTED,
     backoff::ExponentialBackoff,
+    dst,
     error::SendError,
     logging::{log_task_aborted, log_task_started, log_task_stopped},
     mode::ConnectionMode,
@@ -550,7 +551,7 @@ impl WebSocketClientInner {
             return Ok(());
         }
 
-        tokio::time::timeout(self.reconnect_timeout, async {
+        dst::time::timeout(self.reconnect_timeout, async {
             // Attempt to connect; abort early if a disconnect was requested
             let (new_writer, reader) = Self::connect_with_server(
                 &self.config.url,
@@ -594,7 +595,7 @@ impl WebSocketClientInner {
             }
 
             // Delay before closing connection
-            tokio::time::sleep(Duration::from_millis(GRACEFUL_SHUTDOWN_DELAY_MS)).await;
+            dst::time::sleep(Duration::from_millis(GRACEFUL_SHUTDOWN_DELAY_MS)).await;
 
             if ConnectionMode::from_atomic(&self.connection_mode).is_disconnect() {
                 log::debug!("Reconnect aborted mid-flight (after delay)");
@@ -684,17 +685,17 @@ impl WebSocketClientInner {
         let ping_handler = ping_handler.cloned();
 
         tokio::task::spawn(async move {
-            let mut last_data_time = tokio::time::Instant::now();
+            let mut last_data_time = dst::time::Instant::now();
 
             loop {
                 if !ConnectionMode::from_atomic(&connection_state).is_active() {
                     break;
                 }
 
-                match tokio::time::timeout(check_interval, reader.next()).await {
+                match dst::time::timeout(check_interval, reader.next()).await {
                     Ok(Some(Ok(Message::Binary(data)))) => {
                         log::trace!("Received message <binary> {} bytes", data.len());
-                        last_data_time = tokio::time::Instant::now();
+                        last_data_time = dst::time::Instant::now();
 
                         if let Some(ref handler) = message_handler {
                             handler(Message::Binary(data));
@@ -702,7 +703,7 @@ impl WebSocketClientInner {
                     }
                     Ok(Some(Ok(Message::Text(data)))) => {
                         log::trace!("Received message: {data}");
-                        last_data_time = tokio::time::Instant::now();
+                        last_data_time = dst::time::Instant::now();
 
                         if let Some(ref handler) = message_handler {
                             handler(Message::Text(data));
@@ -710,7 +711,8 @@ impl WebSocketClientInner {
                     }
                     Ok(Some(Ok(Message::Ping(ping_data)))) => {
                         log::trace!("Received ping: {ping_data:?}");
-                        last_data_time = tokio::time::Instant::now();
+                        // Do not reset last_data_time: pings are keep-alive frames, not application
+                        // data, so a peer that emits only pings must still trip the idle timeout.
 
                         if let Some(ref handler) = ping_handler {
                             handler(ping_data.to_vec());
@@ -718,7 +720,7 @@ impl WebSocketClientInner {
                     }
                     Ok(Some(Ok(Message::Pong(_)))) => {
                         log::trace!("Received pong");
-                        last_data_time = tokio::time::Instant::now();
+                        // Do not reset last_data_time: pongs are keep-alive replies (not data)
                     }
                     Ok(Some(Ok(Message::Close(_)))) => {
                         log::debug!("Received close message - terminating");
@@ -844,7 +846,7 @@ impl WebSocketClientInner {
 
                         // Attempt to close the writer gracefully before exiting,
                         // we ignore any error as the writer may already be closed.
-                        _ = tokio::time::timeout(
+                        _ = dst::time::timeout(
                             Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS),
                             active_writer.close(),
                         )
@@ -900,7 +902,7 @@ impl WebSocketClientInner {
                     }
                 }
 
-                match tokio::time::timeout(check_interval, writer_rx.recv()).await {
+                match dst::time::timeout(check_interval, writer_rx.recv()).await {
                     Ok(Some(msg)) => {
                         // Re-check connection mode after receiving a message
                         let mode = ConnectionMode::from_atomic(&connection_state);
@@ -913,11 +915,11 @@ impl WebSocketClientInner {
                                 log::debug!("Received new writer");
 
                                 // Delay before closing connection
-                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                dst::time::sleep(Duration::from_millis(100)).await;
 
                                 // Attempt to close the writer gracefully on update,
                                 // we ignore any error as the writer may already be closed.
-                                _ = tokio::time::timeout(
+                                _ = dst::time::timeout(
                                     Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS),
                                     active_writer.close(),
                                 )
@@ -969,7 +971,7 @@ impl WebSocketClientInner {
 
             // Attempt to close the writer gracefully before exiting,
             // we ignore any error as the writer may already be closed.
-            _ = tokio::time::timeout(
+            _ = dst::time::timeout(
                 Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS),
                 active_writer.close(),
             )
@@ -991,7 +993,7 @@ impl WebSocketClientInner {
             let interval = Duration::from_secs(heartbeat_secs);
 
             loop {
-                tokio::time::sleep(interval).await;
+                dst::time::sleep(interval).await;
 
                 match ConnectionMode::from_u8(connection_state.load(Ordering::SeqCst)) {
                     ConnectionMode::Active => {
@@ -1330,6 +1332,7 @@ impl WebSocketClient {
         const CHECK_INTERVAL_MS: u64 = 100;
 
         tokio::select! {
+            biased;
             () = self.rate_limiter.await_keys_ready(keys) => Ok(()),
             () = async {
                 loop {
@@ -1339,8 +1342,9 @@ impl WebSocketClient {
                         break;
                     }
                     tokio::select! {
+                        biased;
                         () = notified => {}
-                        () = tokio::time::sleep(Duration::from_millis(CHECK_INTERVAL_MS)) => {}
+                        () = dst::time::sleep(Duration::from_millis(CHECK_INTERVAL_MS)) => {}
                     }
                 }
             } => Err(SendError::Closed),
@@ -1368,7 +1372,7 @@ impl WebSocketClient {
 
         let fallback_interval = Duration::from_millis(FALLBACK_INTERVAL_MS);
 
-        tokio::time::timeout(self.reconnect_timeout, async {
+        dst::time::timeout(self.reconnect_timeout, async {
             loop {
                 // Register notification interest BEFORE checking state to prevent
                 // a race where the state changes between our check and the await
@@ -1384,8 +1388,9 @@ impl WebSocketClient {
                 }
 
                 tokio::select! {
+                    biased;
                     () = notified => {}
-                    () = tokio::time::sleep(fallback_interval) => {}
+                    () = dst::time::sleep(fallback_interval) => {}
                 }
             }
         })
@@ -1427,9 +1432,9 @@ impl WebSocketClient {
             .store(ConnectionMode::Disconnect.as_u8(), Ordering::SeqCst);
         self.state_notify.notify_waiters();
 
-        if tokio::time::timeout(Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS), async {
+        if dst::time::timeout(Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS), async {
             while !self.is_disconnected() {
-                tokio::time::sleep(Duration::from_millis(CONNECTION_STATE_CHECK_INTERVAL_MS)).await;
+                dst::time::sleep(Duration::from_millis(CONNECTION_STATE_CHECK_INTERVAL_MS)).await;
             }
 
             if !self.controller_task.is_finished() {
@@ -1547,8 +1552,9 @@ impl WebSocketClient {
 
             loop {
                 tokio::select! {
+                    biased;
                     () = state_notify.notified() => {}
-                    () = tokio::time::sleep(fallback_interval) => {}
+                    () = dst::time::sleep(fallback_interval) => {}
                 }
 
                 let mut mode = ConnectionMode::from_atomic(&connection_mode);
@@ -1557,9 +1563,9 @@ impl WebSocketClient {
                     log::debug!("Disconnecting");
 
                     let timeout = Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS);
-                    if tokio::time::timeout(timeout, async {
+                    if dst::time::timeout(timeout, async {
                         // Delay awaiting graceful shutdown
-                        tokio::time::sleep(Duration::from_millis(GRACEFUL_SHUTDOWN_DELAY_MS)).await;
+                        dst::time::sleep(Duration::from_millis(GRACEFUL_SHUTDOWN_DELAY_MS)).await;
 
                         if let Some(task) = &inner.read_task
                             && !task.is_finished()
@@ -1638,6 +1644,7 @@ impl WebSocketClient {
 
                     // Race reconnect against disconnect notification
                     let reconnect_result = tokio::select! {
+                        biased;
                         result = inner.reconnect() => Some(result),
                         () = async {
                             loop {
@@ -1692,7 +1699,8 @@ impl WebSocketClient {
                                 log::warn!("Backing off for {}s...", duration.as_secs_f64());
                                 // Race backoff sleep against disconnect
                                 tokio::select! {
-                                    () = tokio::time::sleep(duration) => {}
+                                    biased;
+                                    () = dst::time::sleep(duration) => {}
                                     () = async {
                                         loop {
                                             state_notify.notified().await;
@@ -1806,6 +1814,8 @@ mod tests {
                         .unwrap();
 
                     task::spawn(async move {
+                        // Inner if consumes `msg`, cannot hoist into a match guard
+                        #[expect(clippy::collapsible_match)]
                         while let Some(Ok(msg)) = websocket.next().await {
                             match msg {
                                 WsMessage::Text(txt) if txt == "close-now" => {
@@ -2442,7 +2452,7 @@ mod rust_tests {
                 drop(ws);
             }
             // Don't accept second connection - client will be stuck in RECONNECT
-            sleep(Duration::from_secs(60)).await;
+            sleep(Duration::from_mins(1)).await;
         });
 
         let (handler, _rx) = channel_message_handler();
@@ -2703,7 +2713,7 @@ mod rust_tests {
                 drop(ws);
             }
             // Don't accept second connection - let reconnect hang
-            sleep(Duration::from_secs(60)).await;
+            sleep(Duration::from_mins(1)).await;
         });
 
         let (handler, _rx) = channel_message_handler();
@@ -2768,7 +2778,7 @@ mod rust_tests {
             {
                 drop(ws);
             }
-            sleep(Duration::from_secs(60)).await;
+            sleep(Duration::from_mins(1)).await;
         });
 
         let (handler, _rx) = channel_message_handler();
@@ -3037,6 +3047,137 @@ mod rust_tests {
 
     #[rstest]
     #[tokio::test]
+    async fn test_idle_timeout_fires_when_only_pings_received() {
+        // Regression: pings and pongs are keep-alive frames, not application data,
+        // so a peer that only emits control frames must still trip the idle timeout.
+        // The peer keeps pinging for well past the observation window so the
+        // pre-fix behavior (reset-on-ping) would keep the client active; under the
+        // fix the idle timer never resets and fires after ~500ms.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = task::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+
+            for _ in 0..60 {
+                sleep(Duration::from_millis(100)).await;
+
+                if ws.send(WsMessage::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let (handler, _rx) = channel_message_handler();
+
+        let config = WebSocketConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            headers: vec![],
+            heartbeat: None,
+            heartbeat_msg: None,
+            reconnect_timeout_ms: Some(2_000),
+            reconnect_delay_initial_ms: Some(50),
+            reconnect_delay_max_ms: Some(100),
+            reconnect_backoff_factor: Some(1.0),
+            reconnect_jitter_ms: Some(0),
+            reconnect_max_attempts: Some(1),
+            idle_timeout_ms: Some(500),
+        };
+
+        let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
+            .await
+            .unwrap();
+
+        assert!(client.is_active());
+
+        // Observation window is shorter than the ping stream (6s). If the idle
+        // timer mistakenly reset on every ping the client would still be active
+        // here; under the fix it goes inactive at ~500ms.
+        wait_until_async(
+            || async { client.is_reconnecting() || client.is_disconnected() },
+            Duration::from_millis(1_500),
+        )
+        .await;
+
+        assert!(
+            !client.is_active(),
+            "Client should not be active after idle timeout when only pings/pongs flow"
+        );
+
+        client.disconnect().await;
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_idle_timeout_fires_when_only_pongs_received() {
+        // Regression for the heartbeat-reply path. When the client heartbeat is
+        // enabled, the peer auto-replies with pongs for every outgoing ping. If
+        // those pongs refreshed last_data_time the idle timer would never fire on
+        // a zombie connection (the motivating Polymarket scenario).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = task::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+
+            // Drain incoming frames so tungstenite's internal pong replies are
+            // actually flushed to the client. Hold the connection open well past
+            // the observation window.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+            while tokio::time::Instant::now() < deadline {
+                if let Ok(Some(Err(_)) | None) =
+                    tokio::time::timeout(Duration::from_millis(100), ws.next()).await
+                {
+                    break;
+                }
+            }
+        });
+
+        let (handler, _rx) = channel_message_handler();
+
+        let config = WebSocketConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            headers: vec![],
+            heartbeat: Some(1),
+            heartbeat_msg: None,
+            reconnect_timeout_ms: Some(2_000),
+            reconnect_delay_initial_ms: Some(50),
+            reconnect_delay_max_ms: Some(100),
+            reconnect_backoff_factor: Some(1.0),
+            reconnect_jitter_ms: Some(0),
+            reconnect_max_attempts: Some(1),
+            idle_timeout_ms: Some(1_500),
+        };
+
+        let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
+            .await
+            .unwrap();
+
+        assert!(client.is_active());
+
+        // Heartbeat cadence is 1s; each ping draws a pong reply. Under the fix
+        // the idle timer ignores those pongs and fires at ~1.5s. Under the bug
+        // every pong reset the timer and the client would stay active.
+        wait_until_async(
+            || async { client.is_reconnecting() || client.is_disconnected() },
+            Duration::from_millis(2_500),
+        )
+        .await;
+
+        assert!(
+            !client.is_active(),
+            "Client should not be active after idle timeout when only pongs flow"
+        );
+
+        client.disconnect().await;
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
     async fn test_disconnect_during_backoff_exits_promptly() {
         // Verify that disconnect interrupts backoff sleep (Finding 1).
         // Server accepts then drops, no second listener -> reconnect fails -> enters backoff.
@@ -3050,7 +3191,7 @@ mod rust_tests {
                 let _ = accept_async(stream).await;
             }
             // Don't accept again so reconnect fails and enters backoff
-            sleep(Duration::from_secs(60)).await;
+            sleep(Duration::from_mins(1)).await;
         });
 
         let (handler, _rx) = channel_message_handler();
@@ -3139,7 +3280,7 @@ mod rust_tests {
         };
 
         // Very restrictive: 1 req per 60 seconds
-        let quota = Quota::with_period(Duration::from_secs(60))
+        let quota = Quota::with_period(Duration::from_mins(1))
             .unwrap()
             .allow_burst(NonZeroU32::new(1).unwrap());
 

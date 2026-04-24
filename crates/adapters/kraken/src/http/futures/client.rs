@@ -2497,18 +2497,16 @@ fn parse_multi_collateral_balances(account: &FuturesAccount, balances: &mut Vec<
         );
 
         let total_amount = currency_info.quantity;
-        let total = Money::new(total_amount, currency);
+        let available_amount = currency_info.available.unwrap_or(total_amount);
+        let locked_amount = total_amount - available_amount;
 
-        // Available can exceed quantity with positive PnL, cap to satisfy invariant
-        let available_amount = currency_info
-            .available
-            .unwrap_or(total_amount)
-            .min(total_amount);
-        let locked_amount = (total_amount - available_amount).max(0.0);
-        let locked = Money::new(locked_amount, currency);
-        let free = total - locked;
-
-        balances.push(AccountBalance::new(total, locked, free));
+        push_balance_from_f64(
+            balances,
+            total_amount,
+            locked_amount,
+            currency,
+            currency_code,
+        );
     }
 
     // Multi-collateral accounts track margin in USD even though the
@@ -2517,15 +2515,35 @@ fn parse_multi_collateral_balances(account: &FuturesAccount, balances: &mut Vec<
         && portfolio_value > 0.0
     {
         let usd_currency = Currency::USD();
-        let total_usd = Money::new(portfolio_value, usd_currency);
-        let available_usd = account
-            .available_margin
-            .unwrap_or(portfolio_value)
-            .min(portfolio_value);
-        let locked_usd = Money::new((portfolio_value - available_usd).max(0.0), usd_currency);
-        let free_usd = total_usd - locked_usd;
+        let available_usd = account.available_margin.unwrap_or(portfolio_value);
+        let locked_usd = portfolio_value - available_usd;
 
-        balances.push(AccountBalance::new(total_usd, locked_usd, free_usd));
+        push_balance_from_f64(balances, portfolio_value, locked_usd, usd_currency, "USD");
+    }
+}
+
+// Kraken Futures serves balances as JSON numbers, which serde already parsed to
+// f64. Converting to Decimal here just moves the value into the fixed-point
+// constructor; it does not recover any precision lost at the wire parse.
+fn push_balance_from_f64(
+    balances: &mut Vec<AccountBalance>,
+    total: f64,
+    locked: f64,
+    currency: Currency,
+    ccy_label: &str,
+) {
+    let Some(total_dec) = Decimal::from_f64(total) else {
+        log::warn!("Skipping {ccy_label} balance: non-finite total {total}");
+        return;
+    };
+    let Some(locked_dec) = Decimal::from_f64(locked) else {
+        log::warn!("Skipping {ccy_label} balance: non-finite locked {locked}");
+        return;
+    };
+
+    match AccountBalance::from_total_and_locked(total_dec, locked_dec, currency) {
+        Ok(balance) => balances.push(balance),
+        Err(e) => log::warn!("Skipping {ccy_label} balance: {e}"),
     }
 }
 
@@ -2539,11 +2557,12 @@ fn parse_multi_collateral_margins(account: &FuturesAccount, margins: &mut Vec<Ma
             .as_ref()
             .and_then(|mr| mr.mm)
             .unwrap_or(0.0);
-        let margin_instrument_id = InstrumentId::new(Symbol::new("ACCOUNT"), *KRAKEN_VENUE);
+        // Kraken Futures reports cross-margin aggregates in USD; emit as an
+        // account-wide entry keyed by USD.
         margins.push(MarginBalance::new(
             Money::new(initial_margin, usd_currency),
             Money::new(maintenance, usd_currency),
-            margin_instrument_id,
+            None,
         ));
     }
 }
@@ -2562,22 +2581,14 @@ fn parse_margin_account_balances(account: &FuturesAccount, balances: &mut Vec<Ac
             CurrencyType::Crypto,
         );
 
-        let total = Money::new(amount, currency);
-
-        // Available can exceed balance with positive PnL, cap to satisfy invariant
         let available = account
             .auxiliary
             .as_ref()
             .and_then(|aux| aux.af)
-            .unwrap_or(amount)
-            .min(amount);
+            .unwrap_or(amount);
         let locked = amount - available;
 
-        balances.push(AccountBalance::new(
-            total,
-            Money::new(locked, currency),
-            Money::new(available, currency),
-        ));
+        push_balance_from_f64(balances, amount, locked, currency, currency_code);
     }
 }
 
@@ -2587,11 +2598,10 @@ fn parse_margin_account_margins(account: &FuturesAccount, margins: &mut Vec<Marg
         let mm = mr.mm.unwrap_or(0.0);
         if im > 0.0 || mm > 0.0 {
             let usd_currency = Currency::USD();
-            let margin_instrument_id = InstrumentId::new(Symbol::new("ACCOUNT"), *KRAKEN_VENUE);
             margins.push(MarginBalance::new(
                 Money::new(im, usd_currency),
                 Money::new(mm, usd_currency),
-                margin_instrument_id,
+                None,
             ));
         }
     }
@@ -2611,10 +2621,7 @@ fn parse_cash_account_balances(account: &FuturesAccount, balances: &mut Vec<Acco
             CurrencyType::Crypto,
         );
 
-        let total = Money::new(amount, currency);
-        let locked = Money::new(0.0, currency);
-
-        balances.push(AccountBalance::new(total, locked, total));
+        push_balance_from_f64(balances, amount, 0.0, currency, currency_code);
     }
 }
 
@@ -2699,8 +2706,8 @@ mod tests {
 
         assert_eq!(margins.len(), 1);
         let margin = &margins[0];
-        assert_eq!(margin.instrument_id.symbol.as_str(), "ACCOUNT");
-        assert_eq!(margin.instrument_id.venue.as_str(), "KRAKEN");
+        assert!(margin.instrument_id.is_none());
+        assert_eq!(margin.currency.code.as_str(), "USD");
         assert_eq!(margin.initial.as_f64(), 500.0);
         assert_eq!(margin.maintenance.as_f64(), 250.0);
     }
@@ -2803,6 +2810,70 @@ mod tests {
 
         // BTC balance + USD portfolio balance
         assert_eq!(balances.len(), 2);
+    }
+
+    #[rstest]
+    fn test_parse_margin_account_balances_free_is_derived_from_total_minus_locked() {
+        // Regression: `free` must be derived via Money fixed-point subtraction so
+        // the `AccountBalance` invariant `total == locked + free` holds exactly,
+        // rather than using the raw Kraken `af` (available funds) value which
+        // can drift at the currency precision and violate the invariant in
+        // `AccountBalance::new_checked`.
+        let mut bals = AHashMap::new();
+        // Values chosen so that Kraken's raw `af` rounds independently from
+        // `amount - af` at currency precision 8, producing a drifted sum when
+        // `free` is set directly from `af` instead of derived from `total - locked`.
+        // With these f64 values (constructed via arithmetic to hit precise bit
+        // patterns): round(amount * 1e8) = 1_000_000_003, round(af * 1e8) = 4,
+        // and round((amount - af) * 1e8) = 1_000_000_000, so 4 + 1_000_000_000
+        // != 1_000_000_003 and the old parse path violates the invariant.
+        let af_f = 35.0_f64 * 1e-9;
+        let amount_f = 10.0_f64 + af_f;
+        bals.insert("XBT".to_string(), amount_f);
+
+        let account = FuturesAccount {
+            account_type: KrakenFuturesAccountType::MarginAccount,
+            balances: bals,
+            currencies: AHashMap::new(),
+            auxiliary: Some(FuturesAuxiliary {
+                usd: None,
+                pv: None,
+                pnl: None,
+                af: Some(af_f),
+                funding: None,
+            }),
+            margin_requirements: None,
+            portfolio_value: None,
+            available_margin: None,
+            initial_margin: None,
+            pnl: None,
+        };
+
+        let mut balances = Vec::new();
+        parse_margin_account_balances(&account, &mut balances);
+
+        assert_eq!(balances.len(), 1);
+        let balance = &balances[0];
+        // Invariant: total == locked + free (enforced by AccountBalance::new_checked,
+        // but assert here to pin the derivation property at the parse site).
+        assert_eq!(balance.total, balance.locked + balance.free);
+        // Free is the derived side (total - locked), not the raw `af` value.
+        assert_eq!(balance.free, balance.total - balance.locked);
+    }
+
+    #[rstest]
+    #[case::nan_total(f64::NAN, 0.0)]
+    #[case::infinity_total(f64::INFINITY, 0.0)]
+    #[case::neg_infinity_total(f64::NEG_INFINITY, 0.0)]
+    #[case::nan_locked(1.0, f64::NAN)]
+    #[case::infinity_locked(1.0, f64::INFINITY)]
+    fn test_push_balance_from_f64_skips_non_finite(#[case] total: f64, #[case] locked: f64) {
+        let currency = Currency::new("BTC", 8, 0, "BTC", CurrencyType::Crypto);
+        let mut balances = Vec::new();
+
+        push_balance_from_f64(&mut balances, total, locked, currency, "BTC");
+
+        assert!(balances.is_empty());
     }
 
     #[rstest]

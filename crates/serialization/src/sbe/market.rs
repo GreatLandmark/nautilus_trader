@@ -27,7 +27,7 @@ use nautilus_model::data::{
 };
 
 use self::common::{HEADER_LENGTH, decode_header, encode_header, validate_header};
-use super::{SbeCursor, SbeDecodeError, SbeEncodeError};
+use super::{SbeCursor, SbeDecodeError, SbeEncodeError, SbeWriter};
 
 pub const MARKET_SCHEMA_ID: u16 = 1;
 pub const MARKET_SCHEMA_VERSION: u16 = 0;
@@ -111,11 +111,33 @@ pub trait FromSbe: Sized {
     fn from_sbe(bytes: &[u8]) -> Result<Self, SbeDecodeError>;
 }
 
+/// Extension of [`FromSbe`] that reuses allocations between decodes.
+///
+/// Scalar messages decode without heap allocation, so they do not need this trait. Types with
+/// growable internal buffers (for example [`OrderBookDeltas`] with its `Vec<OrderBookDelta>`)
+/// implement it to let callers supply a pre-allocated scratch buffer and avoid per-message
+/// allocation in hot paths.
+pub trait FromSbeReuse: FromSbe {
+    /// Scratch buffer whose allocation is reused across decodes.
+    type Scratch;
+
+    /// Decodes a value from an SBE message buffer, reusing `scratch`'s allocation.
+    ///
+    /// On success, ownership of the allocation moves from `scratch` into the returned value and
+    /// `scratch` is left in its empty state. To continue reusing the allocation, move the buffer
+    /// back from the returned value (for example `scratch = std::mem::take(&mut result.deltas)`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the header is invalid or the payload is malformed.
+    fn from_sbe_reuse(bytes: &[u8], scratch: &mut Self::Scratch) -> Result<Self, SbeDecodeError>;
+}
+
 pub(super) trait MarketSbeMessage: Sized {
     const TEMPLATE_ID: u16;
     const BLOCK_LENGTH: u16;
 
-    fn encode_body(&self, buf: &mut Vec<u8>) -> Result<(), SbeEncodeError>;
+    fn encode_body(&self, writer: &mut SbeWriter<'_>) -> Result<(), SbeEncodeError>;
 
     fn decode_body(cursor: &mut SbeCursor<'_>) -> Result<Self, SbeDecodeError>;
 
@@ -128,16 +150,20 @@ impl<T> ToSbe for T
 where
     T: MarketSbeMessage,
 {
+    #[inline]
     fn to_sbe(&self) -> Result<Vec<u8>, SbeEncodeError> {
         let encoded_size = HEADER_LENGTH + self.encoded_body_size();
         let mut buf = Vec::with_capacity(encoded_size);
-        encode_market_message(self, &mut buf, encoded_size)?;
+        encode_into_uninit(self, &mut buf, encoded_size)?;
         Ok(buf)
     }
 
+    #[inline]
     fn to_sbe_into(&self, buf: &mut Vec<u8>) -> Result<(), SbeEncodeError> {
         let encoded_size = HEADER_LENGTH + self.encoded_body_size();
-        encode_market_message(self, buf, encoded_size)
+        buf.clear();
+        buf.reserve(encoded_size);
+        encode_into_uninit(self, buf, encoded_size)
     }
 }
 
@@ -145,6 +171,7 @@ impl<T> FromSbe for T
 where
     T: MarketSbeMessage,
 {
+    #[inline]
     fn from_sbe(bytes: &[u8]) -> Result<Self, SbeDecodeError> {
         let mut cursor = SbeCursor::new(bytes);
         let header = decode_header(&mut cursor)?;
@@ -153,7 +180,19 @@ where
     }
 }
 
-fn encode_market_message<T>(
+// Writes an SBE message into the spare capacity of `buf` without zero
+// initialization, then commits the length on success. Caller must ensure
+// `buf.len() == 0` and `buf.capacity() >= encoded_size`.
+#[inline]
+#[allow(
+    unsafe_code,
+    reason = "set_len commits writes the SbeWriter has already made into spare capacity"
+)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "load-bearing safety check for the unsafe set_len; panic is the right outcome"
+)]
+fn encode_into_uninit<T>(
     value: &T,
     buf: &mut Vec<u8>,
     encoded_size: usize,
@@ -161,20 +200,38 @@ fn encode_market_message<T>(
 where
     T: MarketSbeMessage,
 {
-    buf.clear();
+    debug_assert_eq!(buf.len(), 0);
+    debug_assert!(buf.capacity() >= encoded_size);
 
-    if buf.capacity() < encoded_size {
-        buf.reserve(encoded_size - buf.capacity());
-    }
-
+    let spare = &mut buf.spare_capacity_mut()[..encoded_size];
+    let mut writer = SbeWriter::new_uninit(spare);
     encode_header(
-        buf,
+        &mut writer,
         T::BLOCK_LENGTH,
         T::TEMPLATE_ID,
         MARKET_SCHEMA_ID,
         MARKET_SCHEMA_VERSION,
     );
-    value.encode_body(buf)?;
-    debug_assert_eq!(buf.len(), encoded_size);
+    value.encode_body(&mut writer)?;
+
+    // Load-bearing for the unsafe `set_len` below: this is the invariant that
+    // converts the writer's per-byte initialization into Vec-level safety. Run
+    // in release builds too so a future size mismatch panics rather than
+    // commits uninit bytes.
+    assert_eq!(
+        writer.pos(),
+        encoded_size,
+        "SBE encode_body wrote {} bytes but encoded_body_size reported {}",
+        writer.pos(),
+        encoded_size,
+    );
+
+    // SAFETY: the writer panics if it attempts to write past `encoded_size`,
+    // the assert above confirms it wrote exactly `encoded_size` bytes, and
+    // errors propagate before `set_len` runs. Reaching this line means the
+    // first `encoded_size` bytes of `buf` hold initialized u8 values.
+    unsafe {
+        buf.set_len(encoded_size);
+    }
     Ok(())
 }

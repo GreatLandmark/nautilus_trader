@@ -441,11 +441,34 @@ The OKX adapter automatically detects and handles exchange-initiated risk manage
 - **Liquidation orders**: When a position is liquidated by the exchange (full or partial), the adapter detects the liquidation category and logs warnings with order details. These orders are processed normally through the order and fill pipeline.
 - **Auto-Deleveraging (ADL)**: When your position is closed by the exchange to offset a counterparty's liquidation, the adapter detects and logs the ADL event with position details.
 
+Detection is driven by the `category` field on the order record. The
+recognised values are:
+
+| `category`              | Meaning                                              |
+|-------------------------|------------------------------------------------------|
+| `full_liquidation`      | Full position liquidation.                           |
+| `partial_liquidation`   | Partial position liquidation.                        |
+| `adl`                   | Auto‑deleveraging close.                             |
+| `delivery`              | Contract delivery at expiry.                         |
+| `normal` / other values | Regular order flow.                                  |
+
+Detection runs on both paths:
+
+- WebSocket `orders` channel (live order/fill updates).
+- HTTP `GET /api/v5/trade/orders-history` and `orders-history-archive`
+  (used during reconciliation and cold-start mass status).
+
 :::info
 **Liquidation and ADL events are logged at WARNING level** with details including order ID, instrument, and state. Monitor your logs for these events as part of your risk management process.
 
 The adapter handles these exchange-generated orders, generating appropriate `OrderFilled` events and updating positions accordingly. No special handling is required in your strategy code.
 :::
+
+Upstream references:
+
+- [Order channel and `category` field](https://www.okx.com/docs-v5/en/#order-book-trading-trade-ws-order-channel)
+- [Auto-Deleveraging mechanism](https://www.okx.com/help/okx-contract-auto-deleveraging-adl)
+- [Liquidation mechanism](https://www.okx.com/help/introduction-to-liquidation)
 
 ## Options trading
 
@@ -502,6 +525,63 @@ order = strategy.order_factory.limit(
 
 When modifying an order, the same `px_usd` or `px_vol` params can be passed to the modify
 command to amend the price in the original pricing mode.
+
+### Option Greeks
+
+OKX publishes two parallel greek sets on the `opt-summary` channel:
+
+- **Black-Scholes (`BLACK_SCHOLES`)**: greeks denominated in USD. Matches the convention used
+  by the Deribit and Bybit adapters.
+- **Price-adjusted (`PRICE_ADJUSTED`)**: greeks denominated in the underlying/coin units.
+  Matches OKX's native contract convention.
+
+By default the adapter emits **both** on every `opt-summary` tick. Each emitted `OptionGreeks`
+carries a `convention` field set to `GreeksConvention.BLACK_SCHOLES` or
+`GreeksConvention.PRICE_ADJUSTED`, so receivers can branch per message.
+
+To narrow the stream, pass `params["greeks_convention"]` on subscribe:
+
+- Single string: `"BLACK_SCHOLES"` or `"PRICE_ADJUSTED"` (case-insensitive)
+- List of strings: `["BLACK_SCHOLES", "PRICE_ADJUSTED"]`
+- Omitted: adapter emits both
+
+Unknown entries log a warning and are skipped. If every requested entry is unknown, the
+adapter falls back to emitting both.
+
+```python
+# Default (both conventions, receiver branches)
+self.subscribe_option_greeks(instrument_id)
+
+def on_option_greeks(self, greeks: OptionGreeks) -> None:
+    if greeks.convention == GreeksConvention.BLACK_SCHOLES:
+        self._handle_bs(greeks)
+    else:
+        self._handle_pa(greeks)
+```
+
+```python
+# Single-convention narrowing
+self.subscribe_option_greeks(
+    instrument_id,
+    params={"greeks_convention": "PRICE_ADJUSTED"},
+)
+```
+
+```python
+# Explicit list (equivalent to the default when both are listed)
+self.subscribe_option_greeks(
+    instrument_id,
+    params={"greeks_convention": ["BLACK_SCHOLES", "PRICE_ADJUSTED"]},
+)
+```
+
+:::note
+The data engine deduplicates option-greeks subscriptions by `instrument_id`, so if two actors
+on one node subscribe to the same instrument with different single conventions only the first
+one reaches the adapter. The second actor gets the first actor's convention set. Workaround:
+either actor can subscribe without `params` (or with the full list) to receive both streams
+and filter locally on `greeks.convention`.
+:::
 
 ### Position Greeks
 

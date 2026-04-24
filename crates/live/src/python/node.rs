@@ -21,12 +21,12 @@ use nautilus_common::{
     actor::data_actor::ImportableActorConfig, cache::CacheConfig, enums::Environment,
     live::get_runtime, logging::logger::LoggerConfig, python::actor::PyDataActor,
 };
-use nautilus_core::UUID4;
-#[allow(
-    unused_imports,
-    reason = "to_pytype_err used in cfg(feature = examples) methods"
-)]
-use nautilus_core::python::{to_pyruntime_err, to_pytype_err, to_pyvalue_err};
+#[cfg(feature = "examples")]
+use nautilus_core::python::to_pytype_err;
+use nautilus_core::{
+    UUID4,
+    python::{to_pyruntime_err, to_pyvalue_err},
+};
 use nautilus_model::identifiers::{ActorId, ComponentId, ExecAlgorithmId, StrategyId, TraderId};
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_system::get_global_pyo3_registry;
@@ -484,7 +484,7 @@ impl LiveNode {
     fn py_add_native_strategy(&mut self, config: &Bound<'_, PyAny>) -> PyResult<()> {
         use nautilus_trading::examples::strategies::{
             DeltaNeutralVol, DeltaNeutralVolConfig, EmaCross, EmaCrossConfig, GridMarketMaker,
-            GridMarketMakerConfig,
+            GridMarketMakerConfig, HurstVpinDirectional, HurstVpinDirectionalConfig,
         };
 
         if let Ok(config) = config.extract::<EmaCrossConfig>() {
@@ -495,6 +495,9 @@ impl LiveNode {
                 .map_err(to_pyruntime_err)
         } else if let Ok(config) = config.extract::<DeltaNeutralVolConfig>() {
             self.add_strategy(DeltaNeutralVol::new(config))
+                .map_err(to_pyruntime_err)
+        } else if let Ok(config) = config.extract::<HurstVpinDirectionalConfig>() {
+            self.add_strategy(HurstVpinDirectional::new(config))
                 .map_err(to_pyruntime_err)
         } else {
             let type_name = config.get_type().name()?;

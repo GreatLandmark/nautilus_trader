@@ -80,7 +80,7 @@ use nautilus_common::live::get_runtime;
 use nautilus_core::{
     UnixNanos,
     datetime::{iso8601_to_unix_nanos, unix_nanos_to_iso8601},
-    string::to_snake_case,
+    string::{conversions::to_snake_case, urlencoding},
 };
 use nautilus_model::{
     data::{
@@ -377,6 +377,7 @@ impl ParquetDataCatalog {
         let mut bars: Vec<Bar> = Vec::new();
         let mut mark_prices: Vec<MarkPriceUpdate> = Vec::new();
         let mut index_prices: Vec<IndexPriceUpdate> = Vec::new();
+        let mut statuses: Vec<InstrumentStatus> = Vec::new();
         let mut closes: Vec<InstrumentClose> = Vec::new();
         // Group custom data by full DataType identity (type_name + identifier + metadata)
         // so each batch is written to the correct path with consistent schema/metadata.
@@ -414,6 +415,9 @@ impl ParquetDataCatalog {
                 Data::IndexPriceUpdate(p) => {
                     index_prices.push(p);
                 }
+                Data::InstrumentStatus(s) => {
+                    statuses.push(s);
+                }
                 Data::InstrumentClose(c) => {
                     closes.push(c);
                 }
@@ -432,6 +436,7 @@ impl ParquetDataCatalog {
         self.write_to_parquet(bars, start, end, skip_disjoint_check)?;
         self.write_to_parquet(mark_prices, start, end, skip_disjoint_check)?;
         self.write_to_parquet(index_prices, start, end, skip_disjoint_check)?;
+        self.write_to_parquet(statuses, start, end, skip_disjoint_check)?;
         self.write_to_parquet(closes, start, end, skip_disjoint_check)?;
 
         for (_, items) in custom_data {
@@ -2519,11 +2524,32 @@ impl ParquetDataCatalog {
         let directory = self.make_path(data_cls, identifier)?;
         let intervals = self.get_directory_intervals(&directory)?;
 
+        if identifier.is_none() {
+            // `get_directory_intervals` already recursed through every per-identifier
+            // subdirectory via `object_store.list`, so intervals from different
+            // identifiers can overlap. Merge overlaps into a disjoint sorted union
+            // so callers like `query_last_timestamp` see the true max end and
+            // `consolidate_data_by_period` sees contiguous coverage.
+            let mut merged: Vec<(u64, u64)> = Vec::new();
+
+            for interval in intervals {
+                if let Some(last) = merged.last_mut()
+                    && interval.0 <= last.1
+                {
+                    last.1 = last.1.max(interval.1);
+                    continue;
+                }
+                merged.push(interval);
+            }
+
+            return Ok(merged);
+        }
+
         // For bars, fall back to partial matching when the exact directory
         // doesn't exist (callers may pass an instrument_id like "EUR/USD.SIM"
         // but bars are stored under bar_type dirs like "EURUSD.SIM-1-MINUTE-...")
 
-        if !intervals.is_empty() || data_cls != "bars" || identifier.is_none() {
+        if !intervals.is_empty() || data_cls != "bars" {
             return Ok(intervals);
         }
 
@@ -3267,6 +3293,11 @@ impl ParquetDataCatalog {
                             self.convert_record_batches_to_data(batches, false)?;
                         prices.into_iter().map(Data::from).collect()
                     }
+                    "instrument_status" => {
+                        let statuses: Vec<InstrumentStatus> =
+                            self.convert_record_batches_to_data(batches, false)?;
+                        statuses.into_iter().map(Data::from).collect()
+                    }
                     "instrument_closes" => {
                         let closes: Vec<InstrumentClose> =
                             self.convert_record_batches_to_data(batches, false)?;
@@ -3723,6 +3754,9 @@ impl ParquetDataCatalog {
                     }
                     self.write_to_parquet(data, None, None, None)?;
                 }
+                "instrument_status" => {
+                    self.write_typed_batches::<InstrumentStatus>(batches)?;
+                }
                 "instrument_closes" => {
                     let mut data: Vec<InstrumentClose> =
                         self.convert_record_batches_to_data(batches, use_ts_event_for_ts_init)?;
@@ -3734,9 +3768,6 @@ impl ParquetDataCatalog {
                 }
                 "funding_rate_update" => {
                     self.write_typed_batches::<FundingRateUpdate>(batches)?;
-                }
-                "instrument_status" => {
-                    self.write_typed_batches::<InstrumentStatus>(batches)?;
                 }
                 "account_state" => {
                     self.write_typed_batches::<AccountState>(batches)?;
@@ -3900,10 +3931,10 @@ impl_catalog_path_prefix!(OrderBookDepth10, "order_book_depths");
 impl_catalog_path_prefix!(Bar, "bars");
 impl_catalog_path_prefix!(IndexPriceUpdate, "index_prices");
 impl_catalog_path_prefix!(MarkPriceUpdate, "mark_prices");
-impl_catalog_path_prefix!(InstrumentClose, "instrument_closes");
-impl_catalog_path_prefix!(InstrumentAny, "instruments");
 impl_catalog_path_prefix!(FundingRateUpdate, "funding_rate_update");
 impl_catalog_path_prefix!(InstrumentStatus, "instrument_status");
+impl_catalog_path_prefix!(InstrumentClose, "instrument_closes");
+impl_catalog_path_prefix!(InstrumentAny, "instruments");
 impl_catalog_path_prefix!(AccountState, "account_state");
 impl_catalog_path_prefix!(OrderInitialized, "order_initialized");
 impl_catalog_path_prefix!(OrderDenied, "order_denied");

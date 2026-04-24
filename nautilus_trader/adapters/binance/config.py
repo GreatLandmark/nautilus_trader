@@ -95,6 +95,8 @@ class BinanceDataClientConfig(LiveDataClientConfig, frozen=True):
         The HTTP client custom endpoint override.
     base_url_ws : str, optional
         The WebSocket client custom endpoint override.
+        Live USD-M Futures data overrides are normalized onto the matching
+        `/market` and `/public` routes.
     proxy_url : str, optional
         The proxy URL for HTTP requests.
     us : bool, default False
@@ -106,6 +108,9 @@ class BinanceDataClientConfig(LiveDataClientConfig, frozen=True):
     use_agg_trade_ticks : bool, default False
         Whether to use aggregated trade tick endpoints instead of raw trades.
         TradeId of ticks will be the Aggregate tradeId returned by Binance.
+        For Futures account types the WebSocket trade subscription always uses
+        ``@aggTrade`` (the non-aggregated ``@trade`` stream is not published),
+        but the HTTP ``request_trade_ticks`` path still honours this flag.
 
     """
 
@@ -152,6 +157,7 @@ class BinanceExecClientConfig(LiveExecClientConfig, frozen=True):
     base_url_ws_stream : str, optional
         The WebSocket stream custom endpoint override for futures user data event delivery.
         Only applicable to futures account types. When ``None``, derived from the environment.
+        Live USD-M Futures stream overrides are normalized onto the `/private` route.
     proxy_url : str, optional
         The proxy URL for HTTP requests.
     us : bool, default False

@@ -21,7 +21,9 @@
 
 use nautilus_model::{
     data::{Data, FundingRateUpdate, InstrumentStatus, option_chain::OptionGreeks},
-    events::{AccountState, OrderEventAny},
+    events::{
+        AccountState, OrderAcceptedBatch, OrderCanceledBatch, OrderEventAny, OrderSubmittedBatch,
+    },
     instruments::InstrumentAny,
 };
 use strum::Display;
@@ -57,6 +59,9 @@ pub enum DataEvent {
 #[derive(Debug, Display)]
 pub enum ExecutionEvent {
     Order(OrderEventAny),
+    OrderSubmittedBatch(OrderSubmittedBatch),
+    OrderAcceptedBatch(OrderAcceptedBatch),
+    OrderCanceledBatch(OrderCanceledBatch),
     Report(ExecutionReport),
     Account(AccountState),
 }

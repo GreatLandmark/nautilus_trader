@@ -69,12 +69,13 @@ use nautilus_model::defi::{
 };
 use nautilus_model::{
     data::{
-        Bar, BarType, Data, DataType, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate,
-        OrderBookDeltas, OrderBookDeltas_API, OrderBookDepth10, QuoteTick, TradeTick,
+        Bar, BarType, Data, DataType, FundingRateUpdate, IndexPriceUpdate, InstrumentStatus,
+        MarkPriceUpdate, OrderBookDeltas, OrderBookDeltas_API, OrderBookDepth10, QuoteTick,
+        TradeTick,
         option_chain::StrikeRange,
         stubs::{OrderBookDeltaTestBuilder, stub_delta, stub_deltas, stub_depth10},
     },
-    enums::{BookType, OptionKind, PriceType},
+    enums::{BookType, MarketStatusAction, OptionKind, PriceType},
     identifiers::{ClientId, InstrumentId, OptionSeriesId, TraderId, Venue},
     instruments::{
         CurrencyPair, Instrument, InstrumentAny,
@@ -82,7 +83,7 @@ use nautilus_model::{
     },
     orderbook::OrderBook,
     stubs::TestDefault,
-    types::Price,
+    types::{Price, Quantity},
 };
 use rstest::*;
 
@@ -2045,6 +2046,163 @@ fn test_process_bar(data_engine: Rc<RefCell<DataEngine>>, data_client: DataClien
     assert_eq!(cache.bar(&bar.bar_type), Some(bar).as_ref());
     assert_eq!(messages.len(), 1);
     assert!(messages.contains(&bar));
+}
+
+#[rstest]
+fn test_process_instrument_status(
+    audusd_sim: CurrencyPair,
+    data_engine: Rc<RefCell<DataEngine>>,
+    data_client: DataClientAdapter,
+) {
+    let client_id = data_client.client_id;
+    let venue = data_client.venue;
+    data_engine.borrow_mut().register_client(data_client, None);
+
+    let sub = SubscribeInstrumentStatus::new(
+        audusd_sim.id,
+        Some(client_id),
+        venue,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    let cmd = DataCommand::Subscribe(SubscribeCommand::InstrumentStatus(sub));
+
+    data_engine.borrow_mut().execute(cmd);
+
+    let status = InstrumentStatus::new(
+        audusd_sim.id,
+        MarketStatusAction::Trading,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+        None,
+        None,
+        Some(true),
+        Some(true),
+        None,
+    );
+    let handler = msgbus::stubs::get_message_saving_handler::<InstrumentStatus>(None);
+    let topic = switchboard::get_instrument_status_topic(status.instrument_id);
+    msgbus::subscribe_any(topic.into(), handler.clone(), None);
+
+    let mut data_engine = data_engine.borrow_mut();
+    data_engine.process_data(Data::InstrumentStatus(status));
+    let cache = data_engine.get_cache();
+    let messages = msgbus::stubs::get_saved_messages::<InstrumentStatus>(&handler);
+
+    assert_eq!(messages.len(), 1);
+    assert!(messages.contains(&status));
+    assert_eq!(cache.instrument_status(&audusd_sim.id), Some(&status));
+    assert_eq!(
+        cache.instrument_statuses(&audusd_sim.id),
+        Some(vec![status]),
+    );
+}
+
+#[rstest]
+fn test_process_instrument_status_through_any(
+    audusd_sim: CurrencyPair,
+    data_engine: Rc<RefCell<DataEngine>>,
+    data_client: DataClientAdapter,
+) {
+    let client_id = data_client.client_id;
+    let venue = data_client.venue;
+    data_engine.borrow_mut().register_client(data_client, None);
+
+    let sub = SubscribeInstrumentStatus::new(
+        audusd_sim.id,
+        Some(client_id),
+        venue,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    let cmd = DataCommand::Subscribe(SubscribeCommand::InstrumentStatus(sub));
+    data_engine.borrow_mut().execute(cmd);
+
+    let status = InstrumentStatus::new(
+        audusd_sim.id,
+        MarketStatusAction::Trading,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+        None,
+        None,
+        Some(true),
+        Some(true),
+        None,
+    );
+    let handler = msgbus::stubs::get_message_saving_handler::<InstrumentStatus>(None);
+    let topic = switchboard::get_instrument_status_topic(status.instrument_id);
+    msgbus::subscribe_any(topic.into(), handler.clone(), None);
+
+    let mut data_engine = data_engine.borrow_mut();
+    // Drive through the process() entrypoint with `&dyn Any`
+    data_engine.process(&status as &dyn Any);
+    let cache = data_engine.get_cache();
+    let messages = msgbus::stubs::get_saved_messages::<InstrumentStatus>(&handler);
+
+    assert_eq!(messages.len(), 1);
+    assert!(messages.contains(&status));
+    assert_eq!(cache.instrument_status(&audusd_sim.id), Some(&status));
+}
+
+#[rstest]
+fn test_process_instrument_status_updates_existing(
+    audusd_sim: CurrencyPair,
+    data_engine: Rc<RefCell<DataEngine>>,
+    data_client: DataClientAdapter,
+) {
+    let client_id = data_client.client_id;
+    let venue = data_client.venue;
+    data_engine.borrow_mut().register_client(data_client, None);
+
+    let sub = SubscribeInstrumentStatus::new(
+        audusd_sim.id,
+        Some(client_id),
+        venue,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    let cmd = DataCommand::Subscribe(SubscribeCommand::InstrumentStatus(sub));
+    data_engine.borrow_mut().execute(cmd);
+
+    let status1 = InstrumentStatus::new(
+        audusd_sim.id,
+        MarketStatusAction::PreOpen,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+        None,
+        None,
+        Some(false),
+        Some(false),
+        None,
+    );
+    let status2 = InstrumentStatus::new(
+        audusd_sim.id,
+        MarketStatusAction::Trading,
+        UnixNanos::from(3),
+        UnixNanos::from(4),
+        None,
+        None,
+        Some(true),
+        Some(true),
+        None,
+    );
+
+    let mut data_engine = data_engine.borrow_mut();
+    data_engine.process_data(Data::InstrumentStatus(status1));
+    data_engine.process_data(Data::InstrumentStatus(status2));
+    let cache = data_engine.get_cache();
+
+    assert_eq!(cache.instrument_status(&audusd_sim.id), Some(&status2));
+    assert_eq!(
+        cache.instrument_statuses(&audusd_sim.id),
+        Some(vec![status2, status1]),
+    );
 }
 
 #[cfg(feature = "defi")]
@@ -4490,6 +4648,7 @@ fn make_subscribe_option_chain(
         UnixNanos::default(),
         client_id,
         venue,
+        None,
     )))
 }
 
@@ -4792,11 +4951,101 @@ fn test_subscribe_option_chain_resubscribe_replaces_manager(
 }
 
 #[rstest]
+#[case::close(MarketStatusAction::Close, 1, 1)]
+#[case::not_available(MarketStatusAction::NotAvailableForTrading, 1, 1)]
+#[case::trading(MarketStatusAction::Trading, 0, 0)]
+fn test_process_instrument_status_expires_option_chain_instrument(
+    #[case] action: MarketStatusAction,
+    #[case] expected_quote_unsubs: usize,
+    #[case] expected_greeks_unsubs: usize,
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let client_id = ClientId::new("DERIBIT");
+    let venue = Venue::new("DERIBIT");
+    let recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+
+    register_mock_client(
+        clock,
+        cache.clone(),
+        client_id,
+        venue,
+        Some(venue),
+        &recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    // Add two options to the cache so the option chain has multiple members;
+    // we will only expire one and assert teardown is scoped to that instrument.
+    let call = make_btc_option("50000.000", OptionKind::Call);
+    let put = make_btc_option("50000.000", OptionKind::Put);
+    let call_id = call.id();
+    let _ = cache.borrow_mut().add_instrument(call);
+    let _ = cache.borrow_mut().add_instrument(put);
+
+    let series_id = make_series_id();
+    let cmd = make_subscribe_option_chain(
+        series_id,
+        vec![Price::from("50000.000")],
+        Some(client_id),
+        Some(venue),
+    );
+    data_engine.borrow_mut().execute(cmd);
+
+    // Clear the recorder so only commands triggered by the status are counted.
+    recorder.borrow_mut().clear();
+
+    let status = InstrumentStatus::new(
+        call_id,
+        action,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+        None,
+        None,
+        Some(false),
+        Some(false),
+        None,
+    );
+    data_engine
+        .borrow_mut()
+        .process_data(Data::InstrumentStatus(status));
+
+    let recorded = recorder.borrow();
+    let quote_unsubs = recorded
+        .iter()
+        .filter(|cmd| matches!(cmd, DataCommand::Unsubscribe(UnsubscribeCommand::Quotes(_))))
+        .count();
+    let greeks_unsubs = recorded
+        .iter()
+        .filter(|cmd| {
+            matches!(
+                cmd,
+                DataCommand::Unsubscribe(UnsubscribeCommand::OptionGreeks(_))
+            )
+        })
+        .count();
+
+    // Cache write happens regardless of action
+    assert_eq!(
+        data_engine.borrow().get_cache().instrument_status(&call_id),
+        Some(&status),
+    );
+    assert_eq!(quote_unsubs, expected_quote_unsubs);
+    assert_eq!(greeks_unsubs, expected_greeks_unsubs);
+}
+
+#[rstest]
 fn test_process_option_greeks_caches_and_publishes(
     clock: Rc<RefCell<TestClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
-    use nautilus_model::data::{greeks::OptionGreekValues, option_chain::OptionGreeks};
+    use nautilus_model::{
+        data::{greeks::OptionGreekValues, option_chain::OptionGreeks},
+        enums::GreeksConvention,
+    };
 
     let _ = msgbus::get_message_bus();
     let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
@@ -4825,6 +5074,7 @@ fn test_process_option_greeks_caches_and_publishes(
     // Process greeks data through the engine
     let greeks = OptionGreeks {
         instrument_id,
+        convention: GreeksConvention::BlackScholes,
         greeks: OptionGreekValues {
             delta: 0.55,
             gamma: 0.001,
@@ -4898,6 +5148,7 @@ fn test_subscribe_option_chain_atm_relative_requests_forward_prices(
         UnixNanos::default(),
         Some(client_id),
         Some(venue),
+        None,
     )));
     data_engine.borrow_mut().execute(cmd);
 
@@ -4922,4 +5173,438 @@ fn test_subscribe_option_chain_atm_relative_requests_forward_prices(
         quote_subs, 0,
         "No quote subscriptions before forward price bootstrap"
     );
+}
+
+fn synthetic_instrument_id() -> InstrumentId {
+    use nautilus_model::identifiers::Symbol;
+    InstrumentId::new(Symbol::new("BTC-ETH-INDEX"), Venue::synthetic())
+}
+
+#[rstest]
+fn test_counters_increment_per_dispatch(
+    audusd_sim: CurrencyPair,
+    data_engine: Rc<RefCell<DataEngine>>,
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let mut data_engine = data_engine.borrow_mut();
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        clock,
+        cache,
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+
+    assert_eq!(data_engine.command_count(), 0);
+    assert_eq!(data_engine.data_count(), 0);
+    assert_eq!(data_engine.request_count(), 0);
+    assert_eq!(data_engine.response_count(), 0);
+
+    let inst_any = InstrumentAny::CurrencyPair(audusd_sim.clone());
+    data_engine.process(&inst_any as &dyn Any);
+    assert_eq!(data_engine.data_count(), 1);
+
+    let quote = QuoteTick::new(
+        audusd_sim.id,
+        Price::from("0.8000"),
+        Price::from("0.8010"),
+        Quantity::from(1),
+        Quantity::from(1),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    );
+    data_engine.process_data(Data::Quote(quote));
+    assert_eq!(data_engine.data_count(), 2);
+
+    let sub = SubscribeQuotes::new(
+        audusd_sim.id,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    data_engine.execute(DataCommand::Subscribe(SubscribeCommand::Quotes(sub)));
+    assert_eq!(data_engine.command_count(), 1);
+
+    let unsub = UnsubscribeQuotes::new(
+        audusd_sim.id,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    data_engine.execute(DataCommand::Unsubscribe(UnsubscribeCommand::Quotes(unsub)));
+    assert_eq!(data_engine.command_count(), 2);
+
+    let req = RequestQuotes::new(
+        audusd_sim.id,
+        None,
+        None,
+        None,
+        Some(client_id),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    );
+    data_engine.execute(DataCommand::Request(RequestCommand::Quotes(req)));
+    assert_eq!(data_engine.request_count(), 1);
+    assert_eq!(
+        data_engine.command_count(),
+        2,
+        "Request must not increment command_count"
+    );
+}
+
+#[rstest]
+fn test_reset_resets_counters(
+    audusd_sim: CurrencyPair,
+    data_engine: Rc<RefCell<DataEngine>>,
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let mut data_engine = data_engine.borrow_mut();
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        clock,
+        cache,
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+
+    let inst_any = InstrumentAny::CurrencyPair(audusd_sim);
+    data_engine.process(&inst_any as &dyn Any);
+    assert_eq!(data_engine.data_count(), 1);
+
+    data_engine.reset();
+
+    assert_eq!(data_engine.command_count(), 0);
+    assert_eq!(data_engine.data_count(), 0);
+    assert_eq!(data_engine.request_count(), 0);
+    assert_eq!(data_engine.response_count(), 0);
+}
+
+fn build_synthetic_subscribe(
+    variant: &str,
+    instrument_id: InstrumentId,
+    client_id: ClientId,
+    venue: Venue,
+    ts: UnixNanos,
+) -> DataCommand {
+    let id = UUID4::new();
+
+    match variant {
+        "instrument" => {
+            DataCommand::Subscribe(SubscribeCommand::Instrument(SubscribeInstrument::new(
+                instrument_id,
+                Some(client_id),
+                Some(venue),
+                id,
+                ts,
+                None,
+                None,
+            )))
+        }
+        "status" => DataCommand::Subscribe(SubscribeCommand::InstrumentStatus(
+            SubscribeInstrumentStatus::new(
+                instrument_id,
+                Some(client_id),
+                Some(venue),
+                id,
+                ts,
+                None,
+                None,
+            ),
+        )),
+        "close" => DataCommand::Subscribe(SubscribeCommand::InstrumentClose(
+            SubscribeInstrumentClose::new(
+                instrument_id,
+                Some(client_id),
+                Some(venue),
+                id,
+                ts,
+                None,
+                None,
+            ),
+        )),
+        "greeks" => {
+            DataCommand::Subscribe(SubscribeCommand::OptionGreeks(SubscribeOptionGreeks::new(
+                instrument_id,
+                Some(client_id),
+                Some(venue),
+                id,
+                ts,
+                None,
+                None,
+            )))
+        }
+        other => panic!("unknown synthetic subscribe variant: {other}"),
+    }
+}
+
+fn build_synthetic_unsubscribe(
+    variant: &str,
+    instrument_id: InstrumentId,
+    client_id: ClientId,
+    venue: Venue,
+    ts: UnixNanos,
+) -> DataCommand {
+    let id = UUID4::new();
+
+    match variant {
+        "instrument" => {
+            DataCommand::Unsubscribe(UnsubscribeCommand::Instrument(UnsubscribeInstrument::new(
+                instrument_id,
+                Some(client_id),
+                Some(venue),
+                id,
+                ts,
+                None,
+                None,
+            )))
+        }
+        "status" => DataCommand::Unsubscribe(UnsubscribeCommand::InstrumentStatus(
+            UnsubscribeInstrumentStatus::new(
+                instrument_id,
+                Some(client_id),
+                Some(venue),
+                id,
+                ts,
+                None,
+                None,
+            ),
+        )),
+        "close" => DataCommand::Unsubscribe(UnsubscribeCommand::InstrumentClose(
+            UnsubscribeInstrumentClose::new(
+                instrument_id,
+                Some(client_id),
+                Some(venue),
+                id,
+                ts,
+                None,
+                None,
+            ),
+        )),
+        "greeks" => DataCommand::Unsubscribe(UnsubscribeCommand::OptionGreeks(
+            UnsubscribeOptionGreeks::new(
+                instrument_id,
+                Some(client_id),
+                Some(venue),
+                id,
+                ts,
+                None,
+                None,
+            ),
+        )),
+        other => panic!("unknown synthetic unsubscribe variant: {other}"),
+    }
+}
+
+#[rstest]
+#[case::instrument("instrument")]
+#[case::status("status")]
+#[case::close("close")]
+#[case::greeks("greeks")]
+fn test_subscribe_synthetic_instrument_rejected(
+    #[case] variant: &str,
+    data_engine: Rc<RefCell<DataEngine>>,
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let mut data_engine = data_engine.borrow_mut();
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        clock,
+        cache,
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+
+    let synth_id = synthetic_instrument_id();
+    let cmd = build_synthetic_subscribe(variant, synth_id, client_id, venue, UnixNanos::default());
+    data_engine.execute(cmd);
+
+    assert!(
+        recorder.borrow().is_empty(),
+        "Synthetic subscribe ({variant}) must not reach the client, received {:?}",
+        recorder.borrow()
+    );
+    assert_eq!(
+        data_engine.command_count(),
+        1,
+        "Rejected subscribe must still count as a command"
+    );
+    assert!(!data_engine.subscribed_instruments().contains(&synth_id));
+    assert!(
+        !data_engine
+            .subscribed_instrument_status()
+            .contains(&synth_id)
+    );
+    assert!(
+        !data_engine
+            .subscribed_instrument_close()
+            .contains(&synth_id)
+    );
+}
+
+#[rstest]
+#[case::instrument("instrument")]
+#[case::status("status")]
+#[case::close("close")]
+#[case::greeks("greeks")]
+fn test_unsubscribe_synthetic_instrument_rejected(
+    #[case] variant: &str,
+    data_engine: Rc<RefCell<DataEngine>>,
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let mut data_engine = data_engine.borrow_mut();
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        clock,
+        cache,
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+
+    let synth_id = synthetic_instrument_id();
+    let cmd =
+        build_synthetic_unsubscribe(variant, synth_id, client_id, venue, UnixNanos::default());
+    data_engine.execute(cmd);
+
+    assert!(
+        recorder.borrow().is_empty(),
+        "Synthetic unsubscribe ({variant}) must not reach the client, received {:?}",
+        recorder.borrow()
+    );
+    assert_eq!(
+        data_engine.command_count(),
+        1,
+        "Rejected unsubscribe must still count as a command"
+    );
+}
+
+#[rstest]
+fn test_response_increments_response_count(
+    audusd_sim: CurrencyPair,
+    data_engine: Rc<RefCell<DataEngine>>,
+) {
+    use nautilus_common::messages::data::{DataResponse, InstrumentResponse};
+
+    let mut data_engine = data_engine.borrow_mut();
+
+    let resp = InstrumentResponse::new(
+        UUID4::new(),
+        ClientId::test_default(),
+        audusd_sim.id,
+        InstrumentAny::CurrencyPair(audusd_sim),
+        None,
+        None,
+        UnixNanos::default(),
+        None,
+    );
+    data_engine.response(DataResponse::Instrument(Box::new(resp)));
+
+    assert_eq!(data_engine.response_count(), 1);
+
+    data_engine.reset();
+    assert_eq!(data_engine.response_count(), 0);
+}
+
+#[cfg(feature = "defi")]
+#[rstest]
+fn test_execute_defi_command_counters(data_engine: Rc<RefCell<DataEngine>>) {
+    let mut data_engine = data_engine.borrow_mut();
+
+    let instrument_id =
+        InstrumentId::from("0x11b815efB8f581194ae79006d24E0d814B7697F6.Arbitrum:UniswapV3");
+
+    let sub = DataCommand::DefiSubscribe(DefiSubscribeCommand::PoolSwaps(SubscribePoolSwaps {
+        instrument_id,
+        client_id: None,
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        params: None,
+    }));
+    data_engine.execute(sub);
+
+    let unsub =
+        DataCommand::DefiUnsubscribe(DefiUnsubscribeCommand::PoolSwaps(UnsubscribePoolSwaps {
+            instrument_id,
+            client_id: None,
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            params: None,
+        }));
+    data_engine.execute(unsub);
+
+    let req = DataCommand::DefiRequest(DefiRequestCommand::PoolSnapshot(RequestPoolSnapshot {
+        instrument_id,
+        client_id: None,
+        request_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        params: None,
+    }));
+    data_engine.execute(req);
+
+    assert_eq!(
+        data_engine.command_count(),
+        2,
+        "DefiSubscribe + DefiUnsubscribe must increment command_count"
+    );
+    assert_eq!(
+        data_engine.request_count(),
+        1,
+        "DefiRequest must increment request_count"
+    );
+}
+
+#[cfg(feature = "defi")]
+#[rstest]
+fn test_process_defi_data_increments_data_count(
+    data_engine: Rc<RefCell<DataEngine>>,
+    data_client: DataClientAdapter,
+) {
+    data_engine.borrow_mut().register_client(data_client, None);
+
+    let blockchain = Blockchain::Ethereum;
+    let block = Block::new(
+        "0x123".to_string(),
+        "0x456".to_string(),
+        1u64,
+        "miner".into(),
+        1000000u64,
+        500000u64,
+        UnixNanos::from(1),
+        Some(blockchain),
+    );
+
+    let mut data_engine = data_engine.borrow_mut();
+    assert_eq!(data_engine.data_count(), 0);
+    data_engine.process_defi_data(DefiData::Block(block));
+    assert_eq!(data_engine.data_count(), 1);
 }

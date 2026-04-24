@@ -1500,25 +1500,38 @@ impl PyStrategy {
     }
 
     #[pyo3(name = "query_account")]
-    #[pyo3(signature = (account_id, client_id=None))]
+    #[pyo3(signature = (account_id, client_id=None, params=None))]
     fn py_query_account(
         &mut self,
+        py: Python<'_>,
         account_id: AccountId,
         client_id: Option<ClientId>,
+        params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
-        Strategy::query_account(self.inner_mut(), account_id, client_id).map_err(to_pyruntime_err)
+        let params_map = match params {
+            Some(dict) => from_pydict(py, dict)?,
+            None => None,
+        };
+        Strategy::query_account(self.inner_mut(), account_id, client_id, params_map)
+            .map_err(to_pyruntime_err)
     }
 
     #[pyo3(name = "query_order")]
-    #[pyo3(signature = (order, client_id=None))]
+    #[pyo3(signature = (order, client_id=None, params=None))]
     fn py_query_order(
         &mut self,
         py: Python<'_>,
         order: Py<PyAny>,
         client_id: Option<ClientId>,
+        params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         let order = pyobject_to_order_any(py, order)?;
-        Strategy::query_order(self.inner_mut(), &order, client_id).map_err(to_pyruntime_err)
+        let params_map = match params {
+            Some(dict) => from_pydict(py, dict)?,
+            None => None,
+        };
+        Strategy::query_order(self.inner_mut(), &order, client_id, params_map)
+            .map_err(to_pyruntime_err)
     }
 
     #[pyo3(name = "on_start")]
@@ -2014,21 +2027,29 @@ impl PyStrategy {
     }
 
     #[pyo3(name = "subscribe_option_chain")]
-    #[pyo3(signature = (series_id, strike_range, snapshot_interval_ms=None, client_id=None))]
+    #[pyo3(signature = (series_id, strike_range, snapshot_interval_ms=None, client_id=None, params=None))]
     fn py_subscribe_option_chain(
         &mut self,
+        py: Python<'_>,
         series_id: OptionSeriesId,
         strike_range: PyStrikeRange,
         snapshot_interval_ms: Option<u64>,
         client_id: Option<ClientId>,
-    ) {
+        params: Option<Py<PyDict>>,
+    ) -> PyResult<()> {
+        let params_map = match params {
+            Some(dict) => from_pydict(py, dict)?,
+            None => None,
+        };
         DataActor::subscribe_option_chain(
             self.inner_mut(),
             series_id,
             strike_range.inner,
             snapshot_interval_ms,
             client_id,
+            params_map,
         );
+        Ok(())
     }
 
     #[pyo3(name = "subscribe_order_fills")]
@@ -2630,8 +2651,8 @@ mod tests {
             stubs::stub_custom_data,
         },
         enums::{
-            AggressorSide, BookType, InstrumentCloseType, MarketStatusAction, OrderSide,
-            PositionSide,
+            AggressorSide, BookType, GreeksConvention, InstrumentCloseType, MarketStatusAction,
+            OrderSide, PositionSide,
         },
         events::{
             OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
@@ -2888,6 +2909,7 @@ class TrackingStrategy:
     fn sample_option_greeks() -> OptionGreeks {
         OptionGreeks {
             instrument_id: InstrumentId::from("AUD/USD.SIM"),
+            convention: GreeksConvention::BlackScholes,
             greeks: OptionGreekValues {
                 delta: 0.55,
                 gamma: 0.03,

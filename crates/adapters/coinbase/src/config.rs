@@ -15,7 +15,12 @@
 
 //! Configuration structures for the Coinbase adapter.
 
-use crate::common::{enums::CoinbaseEnvironment, urls};
+use nautilus_model::enums::AccountType;
+
+use crate::common::{
+    enums::{CoinbaseEnvironment, CoinbaseMarginType},
+    urls,
+};
 
 /// Configuration for the Coinbase data client.
 #[derive(Clone, Debug, bon::Builder)]
@@ -52,6 +57,12 @@ pub struct CoinbaseDataClientConfig {
     /// Interval for refreshing instruments in minutes.
     #[builder(default = 60)]
     pub update_instruments_interval_mins: u64,
+    /// Seconds between REST polls for derivatives-only data streams
+    /// (`IndexPriceUpdate`, `FundingRateUpdate`). Coinbase Advanced Trade
+    /// does not publish these on a WebSocket channel, so they are sourced
+    /// from periodic `/products/{id}` fetches.
+    #[builder(default = 15)]
+    pub derivatives_poll_interval_secs: u64,
 }
 
 impl Default for CoinbaseDataClientConfig {
@@ -134,6 +145,16 @@ pub struct CoinbaseExecClientConfig {
     /// Maximum retry delay in milliseconds.
     #[builder(default = 5000)]
     pub retry_delay_max_ms: u64,
+    /// Nautilus account type for the factory. The Cash factory ignores this and
+    /// hardcodes Cash; the derivatives factory sets it to Margin.
+    #[builder(default = AccountType::Cash)]
+    pub account_type: AccountType,
+    /// Optional default margin type applied to derivatives orders. Ignored on
+    /// Cash accounts.
+    pub default_margin_type: Option<CoinbaseMarginType>,
+    /// Optional default leverage applied to derivatives orders. Ignored on
+    /// Cash accounts.
+    pub default_leverage: Option<rust_decimal::Decimal>,
 }
 
 impl Default for CoinbaseExecClientConfig {

@@ -200,6 +200,21 @@ build-dry-run:  #-- Show build commands without executing them
 .PHONY: clean
 clean: clean-build-artifacts clean-caches clean-builds  #-- Clean all build artifacts, caches, and builds
 
+.PHONY: ib-stop
+ib-stop:  #-- Stop local TWS/IBC processes and Docker IB Gateway containers
+	@echo "Stopping local TWS/IBC processes..."
+	@pkill -TERM -f "Trader Workstation" || true
+	@pkill -TERM -f "ibcstart.sh" || true
+	@pkill -TERM -f "displaybannerandlaunch.sh" || true
+	@echo "Stopping Docker IB Gateway containers..."
+	@docker ps --format '{{.Names}} {{.Image}}' | awk '/ib-gateway|ibgateway|Trader Workstation|tws/ {print $$1}' | xargs -r docker stop >/dev/null 2>&1 || true
+	@sleep 2
+	@pkill -KILL -f "Trader Workstation" || true
+	@pkill -KILL -f "ibcstart.sh" || true
+	@pkill -KILL -f "displaybannerandlaunch.sh" || true
+	@docker ps --format '{{.Names}} {{.Image}}' | awk '/ib-gateway|ibgateway|Trader Workstation|tws/ {print $$1}' | xargs -r docker kill >/dev/null 2>&1 || true
+	@echo "Done."
+
 .PHONY: clean-builds
 clean-builds:  #-- Clean distribution and target directories
 	$Q rm -rf dist target target-v2 2>/dev/null || true
@@ -321,11 +336,20 @@ outdated: check-edit-installed  #-- Check for outdated dependencies
 	[ $$outdated_count -eq 0 ] && printf "$(GREEN)  All tools up to date ✓$(RESET)\n"
 
 .PHONY: update
-update: cargo-update  #-- Update all dependencies (cargo and uv)
-	uv self update $(UV_VERSION) && uv lock --upgrade
+update: cargo-update update-uv  #-- Update all dependencies (cargo and uv)
+	uv lock --upgrade
+
+.PHONY: update-uv
+update-uv:  #-- Install or upgrade uv to the version pinned in pyproject.toml
+	$(info $(M) Ensuring uv $(UV_VERSION) is installed...)
+	@if [ "$$(uv --version 2>/dev/null | awk '{print $$2}')" = "$(UV_VERSION)" ]; then \
+		printf "$(GREEN)uv $(UV_VERSION) already installed$(RESET)\n"; \
+	else \
+		curl -LsSf https://astral.sh/uv/$(UV_VERSION)/install.sh | sh; \
+	fi
 
 .PHONY: install-tools
-install-tools: check-binstall-installed  #-- Install required development tools (pinned versions from Cargo.toml, tools.toml, pyproject.toml)
+install-tools: check-binstall-installed update-uv  #-- Install required development tools (pinned versions from Cargo.toml, tools.toml, pyproject.toml)
 	cargo install cargo-deny --version $(CARGO_DENY_VERSION) --locked \
 	&& cargo install cargo-edit --version $(CARGO_EDIT_VERSION) --locked \
 	&& cargo install cargo-machete --version $(CARGO_MACHETE_VERSION) --locked \
@@ -335,7 +359,6 @@ install-tools: check-binstall-installed  #-- Install required development tools 
 	&& cargo install cargo-vet --version $(CARGO_VET_VERSION) --locked \
 	&& cargo install lychee --version $(LYCHEE_VERSION) --locked \
 	&& cargo binstall prek --version $(PREK_VERSION) --no-confirm --locked \
-	&& uv self update $(UV_VERSION) \
 	&& bash scripts/install-osv-scanner.sh
 
 #== Security
@@ -395,8 +418,14 @@ docs-check-links:  #-- Check for broken links in documentation (periodic audit)
 		--timeout 30 \
 		--max-concurrency 10 \
 		--accept "100..=103,200..=299,429,502..=504" \
+		--include-fragments \
+		--fallback-extensions md,py,html \
+		--exclude-path .venv \
+		--exclude-path target \
+		--exclude-path docs/python-api-latest \
+		--exclude "file://.*/python-api-latest/.*" \
 		--exclude-file .lycheeignore \
-		"**/*.md"
+		"**/*.md" "docs/**/*.py"
 	@printf "$(GREEN)Link check passed$(RESET)\n"
 
 #== Rust Development
@@ -488,14 +517,14 @@ check-edit-installed:  #-- Verify cargo-edit is installed
 
 .PHONY: check-features
 check-features: check-hack-installed  #-- Verify crate feature combinations compile correctly
-	cargo hack --workspace check --each-feature
+	cargo hack --workspace check --each-feature --all-targets
 
 .PHONY: check-capnp-schemas  #-- Verify Cap'n Proto schemas are up-to-date
 check-capnp-schemas:
 	$(info $(M) Checking if Cap'n Proto schemas are up-to-date...)
 	@if ! command -v capnp > /dev/null 2>&1; then \
 		echo "$(YELLOW)⚠ capnp not installed, skipping schema check$(RESET)"; \
-	elif ! bash scripts/regen_capnp.sh > /dev/null 2>&1; then \
+	elif ! CAPNP_CHECK=1 bash scripts/regen_capnp.sh; then \
 		echo "$(RED)Error: Cap'n Proto regeneration failed$(RESET)"; \
 		echo "Run manually to see errors: ./scripts/regen_capnp.sh"; \
 		exit 1; \

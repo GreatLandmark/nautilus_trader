@@ -209,6 +209,7 @@ pub fn parse_fill_report(
         last_px,
         commission,
         liquidity_side,
+        avg_px: None,
         report_id: UUID4::new(),
         ts_event,
         ts_init,
@@ -269,6 +270,7 @@ pub fn build_maker_fill_report(
         last_px,
         commission: Money::new(commission_value, currency),
         liquidity_side,
+        avg_px: None,
         report_id: UUID4::new(),
         ts_event,
         ts_init,
@@ -331,11 +333,8 @@ pub fn parse_balance_allowance(
     currency: Currency,
 ) -> anyhow::Result<AccountBalance> {
     let balance_usdc = balance_raw / USDC_SCALE;
-    let total = Money::from_decimal(balance_usdc, currency)
-        .map_err(|e| anyhow::anyhow!("Failed to convert balance: {e}"))?;
-    let locked = Money::new(0.0, currency);
-    let free = total;
-    Ok(AccountBalance::new(total, locked, free))
+    AccountBalance::from_total_and_locked(balance_usdc, Decimal::ZERO, currency)
+        .map_err(|e| anyhow::anyhow!("Failed to convert balance: {e}"))
 }
 
 /// Result of walking the order book to compute market order parameters.
@@ -388,7 +387,7 @@ pub fn calculate_market_price(
 
     match side {
         PolymarketOrderSide::Buy => parsed_levels.sort_by_key(|a| a.0),
-        PolymarketOrderSide::Sell => parsed_levels.sort_by(|a, b| b.0.cmp(&a.0)),
+        PolymarketOrderSide::Sell => parsed_levels.sort_by_key(|b| std::cmp::Reverse(b.0)),
     }
 
     let mut remaining = amount;

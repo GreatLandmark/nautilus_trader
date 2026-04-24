@@ -134,10 +134,37 @@ impl KrakenFuturesWebSocketClient {
         })
     }
 
+    /// Returns true if the WebSocket is authenticated for private feeds.
+    #[pyo3(name = "is_authenticated")]
+    fn py_is_authenticated(&self) -> bool {
+        self.is_authenticated()
+    }
+
+    /// Waits until the WebSocket is authenticated or the timeout elapses.
+    ///
+    /// Returns an error on timeout or explicit auth failure.
+    #[pyo3(name = "wait_until_authenticated")]
+    fn py_wait_until_authenticated<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_secs: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .wait_until_authenticated(timeout_secs)
+                .await
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
     /// Authenticates the WebSocket connection for private feeds.
     ///
-    /// This sends a challenge request, waits for the response, signs it,
-    /// and stores the credentials for use in private subscriptions.
+    /// Sends a challenge request and waits for the handler to parse the response,
+    /// sign it, and mark the `AuthTracker` successful. Private subscriptions gate
+    /// on the stored challenge / signed-challenge pair.
     #[pyo3(name = "authenticate")]
     fn py_authenticate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();

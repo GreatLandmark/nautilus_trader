@@ -456,6 +456,62 @@ impl HyperliquidHttpClient {
         })
     }
 
+    /// Request a single order status report by venue order ID.
+    ///
+    /// Queries `info_frontend_open_orders` and filters for the given oid so the
+    /// result includes trigger metadata (trigger_px, tpsl, trailing_stop, etc.).
+    /// Falls back to `info_order_status` when the order is no longer open.
+    #[pyo3(name = "request_order_status_report")]
+    #[pyo3(signature = (venue_order_id=None, client_order_id=None))]
+    fn py_request_order_status_report<'py>(
+        &self,
+        py: Python<'py>,
+        venue_order_id: Option<&str>,
+        client_order_id: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let venue_order_id = venue_order_id.map(VenueOrderId::from);
+        let client_order_id = client_order_id.map(ClientOrderId::from);
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if venue_order_id.is_none() && client_order_id.is_none() {
+                return Err(to_pyvalue_err(
+                    "at least one of venue_order_id or client_order_id is required",
+                ));
+            }
+
+            let account_address = client.get_account_address().map_err(to_pyvalue_err)?;
+
+            if let Some(coid) = client_order_id.as_ref()
+                && let Some(report) = client
+                    .request_order_status_report_by_client_order_id(&account_address, coid)
+                    .await
+                    .map_err(to_pyvalue_err)?
+            {
+                return Python::attach(|py| Ok(report.into_py_any_unwrap(py)));
+            }
+
+            let report = if let Some(vid) = venue_order_id.as_ref() {
+                let oid: u64 = vid
+                    .as_str()
+                    .parse()
+                    .map_err(|e| to_pyvalue_err(format!("invalid venue_order_id: {e}")))?;
+
+                client
+                    .request_order_status_report(&account_address, oid)
+                    .await
+                    .map_err(to_pyvalue_err)?
+            } else {
+                None
+            };
+
+            Python::attach(|py| match report {
+                Some(r) => Ok(r.into_py_any_unwrap(py)),
+                None => Ok(py.None()),
+            })
+        })
+    }
+
     /// Request fill reports for a user.
     ///
     /// Fetches user fills via `info_user_fills` and parses them into FillReports.
@@ -489,11 +545,18 @@ impl HyperliquidHttpClient {
 
     /// Request position status reports for a user.
     ///
-    /// Fetches clearinghouse state via `info_clearinghouse_state` and parses positions into PositionStatusReports.
-    /// This method requires instruments to be added to the client cache via `cache_instrument()`.
+    /// Fetches perp clearinghouse state and spot clearinghouse state, then returns
+    /// the union of perp asset positions (short/long with PnL) and spot holdings
+    /// (long only). This method requires instruments to be added to the client
+    /// cache via `cache_instrument()`.
     ///
-    /// For vault tokens (starting with "vntls:") that are not in the cache, synthetic instruments
-    /// will be created automatically.
+    /// When `instrument_id` resolves to a specific product type, the opposite
+    /// product's endpoint is skipped to avoid wasted round trips and make
+    /// filtered queries independent of the unused endpoint's availability.
+    ///
+    /// For vault tokens (starting with "vntls:") that are not in the cache,
+    /// synthetic instruments will be created automatically. Spot balances whose
+    /// base token has no cached instrument are skipped with a debug log.
     #[pyo3(name = "request_position_status_reports")]
     fn py_request_position_status_reports<'py>(
         &self,
@@ -520,11 +583,16 @@ impl HyperliquidHttpClient {
 
     /// Request account state (balances and margins) for a user.
     ///
-    /// Fetches clearinghouse state from Hyperliquid API and converts it to `AccountState`.
+    /// Fetches perp and spot clearinghouse state from Hyperliquid and merges them
+    /// into a single `AccountState`. USDC is taken from the perp margin summary
+    /// when present (to avoid double-counting combined `withdrawable`); non-USDC
+    /// tokens are appended from the spot balances.
     ///
     /// # Errors
     ///
-    /// Returns an error if `account_id` is not set or the API request fails.
+    /// Returns an error if `account_id` is not set, or if either the perp or
+    /// spot clearinghouse request fails. Spot failures are propagated so the
+    /// caller sees real API errors instead of a silently truncated snapshot.
     #[pyo3(name = "request_account_state")]
     fn py_request_account_state<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
@@ -537,6 +605,84 @@ impl HyperliquidHttpClient {
                 .map_err(to_pyvalue_err)?;
 
             Python::attach(|py| Ok(account_state.into_py_any_unwrap(py)))
+        })
+    }
+
+    /// Request spot token balances for a user.
+    ///
+    /// Fetches `spotClearinghouseState` and returns one `AccountBalance` per
+    /// non-zero token. USDC is included as a separate balance entry when present;
+    /// callers that also report perp margin state must dedupe currencies before
+    /// emitting an `AccountState`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails or the response cannot be parsed.
+    #[pyo3(name = "request_spot_balances")]
+    fn py_request_spot_balances<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let account_address = client.get_account_address().map_err(to_pyvalue_err)?;
+            let balances = client
+                .request_spot_balances(&account_address)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let pylist =
+                    PyList::new(py, balances.into_iter().map(|b| b.into_py_any_unwrap(py)))?;
+                Ok(pylist.into_py_any_unwrap(py))
+            })
+        })
+    }
+
+    /// Request spot position status reports for a user.
+    ///
+    /// Each non-zero spot balance is reported as a Long position against its
+    /// `{BASE}-{QUOTE}-SPOT` instrument. Balances whose base token has no
+    /// matching instrument in the cache are skipped with a debug log (callers
+    /// should ensure `request_instruments` has run
+    /// first).
+    #[pyo3(name = "request_spot_position_status_reports")]
+    fn py_request_spot_position_status_reports<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let instrument_id = instrument_id.map(InstrumentId::from);
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let account_address = client.get_account_address().map_err(to_pyvalue_err)?;
+            let reports = client
+                .request_spot_position_status_reports(&account_address, instrument_id)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let pylist =
+                    PyList::new(py, reports.into_iter().map(|r| r.into_py_any_unwrap(py)))?;
+                Ok(pylist.into_py_any_unwrap(py))
+            })
+        })
+    }
+
+    /// Get spot clearinghouse state (per-token spot balances) for a user.
+    #[pyo3(name = "info_spot_clearinghouse_state")]
+    fn py_info_spot_clearinghouse_state<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let account_address = client.get_account_address().map_err(to_pyvalue_err)?;
+            let json = client
+                .info_spot_clearinghouse_state(&account_address)
+                .await
+                .map_err(to_pyvalue_err)?;
+            to_string(&json).map_err(to_pyvalue_err)
         })
     }
 

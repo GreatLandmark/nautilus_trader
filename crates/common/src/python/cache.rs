@@ -23,7 +23,7 @@ use nautilus_core::python::to_pyvalue_err;
 use nautilus_model::defi::{Pool, PoolProfiler};
 use nautilus_model::{
     data::{
-        Bar, BarType, FundingRateUpdate, QuoteTick, TradeTick,
+        Bar, BarType, FundingRateUpdate, InstrumentStatus, QuoteTick, TradeTick,
         prices::{IndexPriceUpdate, MarkPriceUpdate},
     },
     enums::{AggregationSource, OmsType, OrderSide, PositionSide, PriceType},
@@ -191,6 +191,16 @@ impl PyCache {
     #[pyo3(name = "funding_rate")]
     fn py_funding_rate(&self, instrument_id: InstrumentId) -> Option<FundingRateUpdate> {
         self.0.borrow().funding_rate(&instrument_id).copied()
+    }
+
+    #[pyo3(name = "instrument_status")]
+    fn py_instrument_status(&self, instrument_id: InstrumentId) -> Option<InstrumentStatus> {
+        self.0.borrow().instrument_status(&instrument_id).copied()
+    }
+
+    #[pyo3(name = "instrument_statuses")]
+    fn py_instrument_statuses(&self, instrument_id: InstrumentId) -> Option<Vec<InstrumentStatus>> {
+        self.0.borrow().instrument_statuses(&instrument_id)
     }
 
     #[pyo3(name = "price")]
@@ -1099,8 +1109,33 @@ impl PyCache {
     }
 
     #[pyo3(name = "position_snapshot_bytes")]
-    fn py_position_snapshot_bytes(&self, position_id: PositionId) -> Option<Vec<u8>> {
+    fn py_position_snapshot_bytes(&self, position_id: PositionId) -> Option<Vec<Vec<u8>>> {
         self.0.borrow().position_snapshot_bytes(&position_id)
+    }
+
+    #[pyo3(name = "snapshot_position")]
+    #[expect(clippy::needless_pass_by_value)]
+    fn py_snapshot_position(&self, py: Python, position: Py<PyAny>) -> PyResult<()> {
+        let position_obj = position.extract::<Position>(py)?;
+        self.0
+            .borrow_mut()
+            .snapshot_position(&position_obj)
+            .map_err(to_pyvalue_err)
+    }
+
+    #[pyo3(name = "position_snapshots", signature = (position_id=None, account_id=None))]
+    fn py_position_snapshots(
+        &self,
+        py: Python,
+        position_id: Option<PositionId>,
+        account_id: Option<AccountId>,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let cache = self.0.borrow();
+        cache
+            .position_snapshots(position_id.as_ref(), account_id.as_ref())
+            .into_iter()
+            .map(|p| Ok(p.into_pyobject(py)?.into()))
+            .collect()
     }
 }
 
@@ -1131,6 +1166,20 @@ impl CacheConfig {
     /// Configuration for `Cache` instances.
     #[new]
     #[expect(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        encoding=None,
+        timestamps_as_iso8601=None,
+        buffer_interval_ms=None,
+        bulk_read_batch_size=None,
+        use_trader_prefix=None,
+        use_instance_id=None,
+        flush_on_start=None,
+        drop_instruments_on_reset=None,
+        tick_capacity=None,
+        bar_capacity=None,
+        save_market_data=None,
+        persist_account_events=None,
+    ))]
     fn py_new(
         encoding: Option<SerializationEncoding>,
         timestamps_as_iso8601: Option<bool>,
@@ -1508,6 +1557,20 @@ impl Cache {
             .map_err(to_pyvalue_err)
     }
 
+    /// Creates a snapshot of the `position` by cloning it, assigning a new ID,
+    /// serializing it, and storing it in the position snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serializing or storing the position snapshot fails.
+    #[pyo3(name = "snapshot_position")]
+    #[expect(clippy::needless_pass_by_value)]
+    fn py_snapshot_position(&mut self, py: Python, position: Py<PyAny>) -> PyResult<()> {
+        let position_obj = position.extract::<Position>(py)?;
+        self.snapshot_position(&position_obj)
+            .map_err(to_pyvalue_err)
+    }
+
     /// Returns a reference to the position with the `position_id` (if found).
     #[pyo3(name = "position")]
     fn py_position(&self, py: Python, position_id: PositionId) -> PyResult<Option<Py<PyAny>>> {
@@ -1722,6 +1785,18 @@ impl Cache {
     #[pyo3(name = "funding_rate")]
     fn py_funding_rate(&self, instrument_id: InstrumentId) -> Option<FundingRateUpdate> {
         self.funding_rate(&instrument_id).copied()
+    }
+
+    /// Gets a reference to the latest instrument status update for the `instrument_id`.
+    #[pyo3(name = "instrument_status")]
+    fn py_instrument_status(&self, instrument_id: InstrumentId) -> Option<InstrumentStatus> {
+        self.instrument_status(&instrument_id).copied()
+    }
+
+    /// Gets all instrument status updates for the `instrument_id`.
+    #[pyo3(name = "instrument_statuses")]
+    fn py_instrument_statuses(&self, instrument_id: InstrumentId) -> Option<Vec<InstrumentStatus>> {
+        self.instrument_statuses(&instrument_id)
     }
 
     /// Gets a reference to the order book for the `instrument_id`.
@@ -2328,10 +2403,31 @@ impl Cache {
         self.strategy_id_for_position(&position_id).copied()
     }
 
-    /// Gets position snapshot bytes for the `position_id`.
+    /// Gets the serialized position snapshot frames for the `position_id`.
+    ///
+    /// Each element in the returned vector is one JSON-encoded `Position` snapshot,
+    /// in the order they were taken.
     #[pyo3(name = "position_snapshot_bytes")]
-    fn py_position_snapshot_bytes(&self, position_id: PositionId) -> Option<Vec<u8>> {
+    fn py_position_snapshot_bytes(&self, position_id: PositionId) -> Option<Vec<Vec<u8>>> {
         self.position_snapshot_bytes(&position_id)
+    }
+
+    /// Returns all position snapshots with the given optional filters.
+    ///
+    /// When `position_id` is `Some`, only snapshots for that position are returned.
+    /// When `account_id` is `Some`, snapshots are filtered to that account.
+    /// Frames that fail to deserialize are skipped with a warning.
+    #[pyo3(name = "position_snapshots", signature = (position_id=None, account_id=None))]
+    fn py_position_snapshots(
+        &self,
+        py: Python,
+        position_id: Option<PositionId>,
+        account_id: Option<AccountId>,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        self.position_snapshots(position_id.as_ref(), account_id.as_ref())
+            .into_iter()
+            .map(|p| Ok(p.into_pyobject(py)?.into()))
+            .collect()
     }
 
     /// Returns a reference to the account for the `account_id` (if found).

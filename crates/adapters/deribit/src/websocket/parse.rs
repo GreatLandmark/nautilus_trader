@@ -26,8 +26,9 @@ use nautilus_model::{
         option_chain::OptionGreeks,
     },
     enums::{
-        AggregationSource, AggressorSide, BarAggregation, BookAction, LiquiditySide, OrderSide,
-        OrderStatus, OrderType, PositionSideSpecified, PriceType, RecordFlag, TimeInForce,
+        AggregationSource, AggressorSide, BarAggregation, BookAction, GreeksConvention,
+        LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSideSpecified, PriceType,
+        RecordFlag, TimeInForce,
     },
     events::{OrderAccepted, OrderCanceled, OrderExpired, OrderUpdated},
     identifiers::{
@@ -577,6 +578,7 @@ pub fn parse_ticker_to_option_greeks(
 
     Some(OptionGreeks {
         instrument_id,
+        convention: GreeksConvention::BlackScholes,
         greeks: deribit_greeks.to_greek_values(),
         mark_iv: msg.mark_iv.and_then(|v| v.to_f64()),
         bid_iv: msg.bid_iv.and_then(|v| v.to_f64()),
@@ -853,6 +855,27 @@ pub fn parse_user_trade_msg(
     let instrument_id = instrument.id();
     let venue_order_id = VenueOrderId::new(&msg.order_id);
     let trade_id = TradeId::new(&msg.trade_id);
+
+    // Deribit marks liquidation-triggered trades with "M" (maker liquidated),
+    // "T" (taker liquidated), or "MT" (both). Absent means a normal trade.
+    if let Some(liq) = msg.liquidation.as_deref().filter(|s| !s.is_empty()) {
+        let who = match liq {
+            "M" => "maker",
+            "T" => "taker",
+            "MT" => "both",
+            _ => liq,
+        };
+        log::warn!(
+            "Liquidation trade: {} trade_id={} order_id={} liquidation_side={} direction={} amount={} price={}",
+            instrument_id,
+            msg.trade_id,
+            msg.order_id,
+            who,
+            msg.direction,
+            msg.amount,
+            msg.price,
+        );
+    }
 
     let order_side = match msg.direction.as_str() {
         "buy" => OrderSide::Buy,

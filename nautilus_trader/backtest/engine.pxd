@@ -487,6 +487,7 @@ cdef class OrderMatchingEngine:
     cpdef void process_cancel(self, CancelOrder command, AccountId account_id)
     cpdef void process_cancel_all(self, CancelAllOrders command, AccountId account_id)
     cpdef void process_batch_cancel(self, BatchCancelOrders command, AccountId account_id)
+    cdef bint _convert_quote_to_base_quantity(self, Order order)
     cdef void _process_market_order(self, MarketOrder order)
     cdef void _process_market_to_limit_order(self, MarketToLimitOrder order)
     cdef void _process_limit_order(self, LimitOrder order)
@@ -568,8 +569,8 @@ cdef class OrderMatchingEngine:
     cdef PositionId _get_position_id(self, Order order, bint generate=*)
     cdef PositionId _generate_venue_position_id(self)
     cdef VenueOrderId _generate_venue_order_id(self)
-    cdef TradeId _generate_trade_id(self)
-    cdef str _generate_trade_id_str(self)
+    cdef TradeId _generate_trade_id(self, uint64_t ts_init)
+    cdef str _generate_trade_id_str(self, uint64_t ts_init)
 
 # -- EVENT HANDLING -------------------------------------------------------------------------------
 

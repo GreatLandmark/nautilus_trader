@@ -33,6 +33,7 @@ python = [
   "pyo3-async-runtimes",
   "pyo3-stub-gen",
 ]
+simulation = ["dep:madsim", "nautilus-core/simulation"]
 turmoil = ["dep:turmoil"]
 
 [package.metadata.docs.rs]
@@ -52,7 +53,6 @@ futures = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
-memchr = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
@@ -70,6 +70,7 @@ url = { workspace = true }
 ustr = { workspace = true }
 webpki-roots = { workspace = true }
 
+madsim = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
 pyo3-async-runtimes = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
@@ -94,4 +95,14 @@ harness = false
 [[bench]]
 name = "http_response"
 path = "benches/http_response.rs"
+harness = false
+
+[[bench]]
+name = "websocket_transport"
+path = "benches/websocket_transport.rs"
+harness = false
+
+[[bench]]
+name = "websocket_latency"
+path = "benches/websocket_latency.rs"
 harness = false

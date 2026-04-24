@@ -1,8 +1,8 @@
 # Book Imbalance Backtest (Betfair)
 
 :::note
-This is a **Rust-only** v2 system tutorial. No Python, no Cython, no Parquet catalog.
-It uses the Rust `BacktestEngine` directly with raw Betfair streaming data.
+This is a **Rust-only** v2 system tutorial. It drives the Rust `BacktestEngine`
+directly with raw Betfair streaming data, bypassing the Python and Parquet paths.
 :::
 
 This tutorial backtests a **book imbalance** actor on Betfair exchange data.
@@ -29,9 +29,9 @@ A positive value means more backing interest for the outcome. Sports
 traders use this as a building-block signal, combining it with price
 momentum or market-wide features.
 
-This example uses the Rust backtest engine directly, without Python or the
-Parquet catalog. A release build processes ~3 million data points per
-second with full order book maintenance in the matching engine.
+This example drives the Rust `BacktestEngine` directly against raw Betfair
+stream files. A release build processes ~3 million data points per second
+with full order book maintenance in the matching engine.
 
 ## Prerequisites
 
@@ -112,7 +112,7 @@ for item in items {
 the `Data` enum (an FFI shim).
 
 Instruments are re-emitted on every market definition update in the stream,
-so the map naturally deduplicates them by keeping the latest version.
+so the map deduplicates them by keeping the latest version.
 
 :::warning
 The `Status` variant carries market status transitions (PreOpen, Trading,
@@ -139,7 +139,7 @@ The second argument is the log interval: print a progress line every 5000
 updates. Set to 0 to disable periodic logging.
 
 The full source is at
-[`crates/trading/src/examples/actors/imbalance.rs`](https://github.com/nautechsystems/nautilus_trader/tree/develop/crates/trading/src/examples/actors/imbalance.rs).
+[`crates/trading/src/examples/actors/imbalance/actor.rs`](https://github.com/nautechsystems/nautilus_trader/tree/develop/crates/trading/src/examples/actors/imbalance/actor.rs).
 
 ### How it works
 
@@ -175,19 +175,13 @@ L2 order book data:
 let mut engine = BacktestEngine::new(BacktestEngineConfig::default())?;
 
 engine.add_venue(
-    Venue::from("BETFAIR"),
-    OmsType::Netting,
-    AccountType::Cash,
-    BookType::L2_MBP,
-    vec![Money::from("1_000_000 GBP")],
-    None,            // base_currency
-    None,            // default_leverage
-    AHashMap::new(), // per-instrument leverages
-    None,            // margin_model
-    vec![],          // simulation modules
-    FillModelAny::default(),
-    FeeModelAny::default(),
-    // ... remaining options default to None
+    SimulatedVenueConfig::builder()
+        .venue(Venue::from("BETFAIR"))
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Cash)
+        .book_type(BookType::L2_MBP)
+        .starting_balances(vec![Money::from("1_000_000 GBP")])
+        .build(),
 )?;
 ```
 
@@ -251,13 +245,13 @@ positive backing imbalance of +0.29 throughout the market lifetime.
 
 ```bash
 # Debug build
-cargo run -p nautilus-betfair --example betfair-backtest
+cargo run -p nautilus-betfair --features examples --example betfair-backtest
 
 # Release build (recommended)
-cargo run -p nautilus-betfair --release --example betfair-backtest
+cargo run -p nautilus-betfair --features examples --release --example betfair-backtest
 
 # Custom data file
-cargo run -p nautilus-betfair --release --example betfair-backtest -- path/to/file.gz
+cargo run -p nautilus-betfair --features examples --release --example betfair-backtest -- path/to/file.gz
 ```
 
 ## Complete source
@@ -269,12 +263,12 @@ The complete example is available at
 
 - **Add a Strategy**: Replace the actor with a `Strategy` implementation that
   places back/lay orders based on the imbalance signal. See the `EmaCross`
-  example in `crates/trading/src/examples/strategies/ema_cross.rs` for the
-  pattern.
+  example in `crates/trading/src/examples/strategies/ema_cross/strategy.rs`
+  for the pattern.
 - **Use managed books**: Set `managed: true` in `subscribe_book_deltas` and
   access the full book via `self.cache().order_book(&id)` for richer signals
   like top-of-book spread, depth ratios, or weighted mid-price.
-- **Multiple markets**: Load several `.gz` files and run them through the
+- **Multiple markets**: Load more `.gz` files and run them through the
   same engine to test cross-market signals.
 - **Compare with Python**: Run the same backtest from Python using the
   `BacktestEngine` Python API. The Rust engine processes the same data

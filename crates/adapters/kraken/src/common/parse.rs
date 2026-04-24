@@ -19,7 +19,7 @@ use std::str::FromStr;
 
 use anyhow::Context;
 use nautilus_core::{
-    datetime::NANOSECONDS_IN_MILLISECOND, nanos::UnixNanos, parsing::precision_from_str,
+    datetime::NANOSECONDS_IN_MILLISECOND, nanos::UnixNanos, string::parsing::precision_from_str,
     uuid::UUID4,
 };
 use nautilus_model::{
@@ -825,6 +825,7 @@ pub fn parse_fill_report(
         last_px,
         commission,
         liquidity_side,
+        avg_px: None,
         report_id: UUID4::new(),
         ts_event,
         ts_init,
@@ -1071,6 +1072,7 @@ pub fn parse_futures_fill_report(
         last_px,
         commission,
         liquidity_side,
+        avg_px: None,
         report_id: UUID4::new(),
         ts_event,
         ts_init,
@@ -1367,6 +1369,34 @@ mod tests {
                 assert!(!perp.is_inverse);
                 assert_eq!(perp.size_increment.as_f64(), 1000.0);
                 assert_eq!(perp.size_precision(), 0);
+            }
+            _ => panic!("Expected CryptoPerpetual"),
+        }
+    }
+
+    #[rstest]
+    fn test_parse_futures_instrument_tokenized_underlying() {
+        let json = load_test_json("http_futures_instruments.json");
+        let response: crate::http::models::FuturesInstrumentsResponse =
+            serde_json::from_str(&json).unwrap();
+
+        let fut_instrument = &response.instruments[3];
+
+        let instrument = parse_futures_instrument(fut_instrument, TS, TS).unwrap();
+
+        match instrument {
+            InstrumentAny::CryptoPerpetual(perp) => {
+                assert_eq!(perp.id.symbol.as_str(), "PF_AAPLxUSD");
+                assert_eq!(perp.raw_symbol.as_str(), "PF_AAPLxUSD");
+                assert_eq!(perp.base_currency.code.as_str(), "AAPLx");
+                assert_eq!(perp.quote_currency.code.as_str(), "USD");
+                assert_eq!(perp.settlement_currency.code.as_str(), "USD");
+                assert!(!perp.is_inverse);
+                assert_eq!(perp.price_increment.as_f64(), 0.01);
+                assert_eq!(perp.size_increment.as_f64(), 0.01);
+                assert_eq!(perp.size_precision(), 2);
+                assert_eq!(perp.margin_init, dec!(0.2));
+                assert_eq!(perp.margin_maint, dec!(0.1));
             }
             _ => panic!("Expected CryptoPerpetual"),
         }

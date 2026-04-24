@@ -1171,9 +1171,12 @@ class OptionGreeks:
         open_interest: float | None = None,
         ts_event: int = 0,
         ts_init: int = 0,
+        convention: GreeksConvention | None = None,
     ) -> None: ...
     @property
     def instrument_id(self) -> InstrumentId: ...
+    @property
+    def convention(self) -> GreeksConvention: ...
     @property
     def delta(self) -> float: ...
     @property
@@ -1542,6 +1545,10 @@ class OmsType(Enum):
 class OptionKind(Enum):
     CALL = "CALL"
     PUT = "PUT"
+
+class GreeksConvention(Enum):
+    BLACK_SCHOLES = "BLACK_SCHOLES"
+    PRICE_ADJUSTED = "PRICE_ADJUSTED"
 
 class OrderSide(Enum):
     NO_ORDER_SIDE = "NO_ORDER_SIDE"
@@ -5353,6 +5360,7 @@ class NautilusDataType(Enum):
     TradeTick = 4
     Bar = 5
     MarkPriceUpdate = 6
+    InstrumentStatus = 7
 
 class DataBackendSession:
     def __init__(self, chunk_size: int = 10_000) -> None: ...
@@ -5471,6 +5479,10 @@ def trades_to_arrow_record_batch_bytes(data: list[TradeTick]) -> bytes: ...
 def bars_to_arrow_record_batch_bytes(data: list[Bar]) -> bytes: ...
 def mark_prices_to_arrow_record_batch_bytes(data: list[IndexPriceUpdate]) -> bytes: ...
 def index_prices_to_arrow_record_batch_bytes(data: list[IndexPriceUpdate]) -> bytes: ...
+def instrument_status_to_arrow_record_batch_bytes(data: list[InstrumentStatus]) -> bytes: ...
+def instrument_status_from_arrow_record_batch_bytes(
+    data: bytes,
+) -> list[InstrumentStatus]: ...
 def instrument_closes_to_arrow_record_batch_bytes(data: list[InstrumentClose]) -> bytes: ...
 
 ###################################################################################################
@@ -7085,6 +7097,7 @@ class BybitHttpClient:
         self,
         product_type: BybitProductType,
         symbol: str | None = None,
+        base_coin: str | None = None,
     ) -> list[Instrument]: ...
     async def request_instrument_statuses(
         self,
@@ -8649,6 +8662,13 @@ class OKXOrderStatus(Enum):
     MMP_CANCELED = ...
     ORDER_PLACED = ...
 
+class OKXGreeksType(Enum):
+    BS = "BS"
+    PA = "PA"
+
+    @property
+    def value(self) -> int: ...  # type: ignore[override]
+
 class OKXVipLevel(Enum):
     VIP0 = "VIP0"
     VIP1 = "VIP1"
@@ -9047,6 +9067,11 @@ class HyperliquidHttpClient:
         self,
         instrument_id: str | None = None,
     ) -> list[OrderStatusReport]: ...
+    async def request_order_status_report(
+        self,
+        venue_order_id: str | None = None,
+        client_order_id: str | None = None,
+    ) -> OrderStatusReport | None: ...
     async def request_fill_reports(
         self,
         instrument_id: str | None = None,
@@ -9055,6 +9080,12 @@ class HyperliquidHttpClient:
         self,
         instrument_id: str | None = None,
     ) -> list[PositionStatusReport]: ...
+    async def request_spot_balances(self) -> list[AccountBalance]: ...
+    async def request_spot_position_status_reports(
+        self,
+        instrument_id: str | None = None,
+    ) -> list[PositionStatusReport]: ...
+    async def info_spot_clearinghouse_state(self) -> str: ...
     async def request_quote_ticks(
         self,
         instrument_id: InstrumentId,
@@ -9559,6 +9590,354 @@ class KrakenFuturesWebSocketClient:
 
 def kraken_product_type_from_symbol(symbol: str) -> KrakenProductType: ...
 
+# Interactive Brokers
+
+class MarketDataType:
+    REALTIME: int = 1
+    FROZEN: int = 2
+    DELAYED: int = 3
+    DELAYED_FROZEN: int = 4
+
+class TradingMode:
+    Paper: str = "paper"
+    Live: str = "live"
+
+class InteractiveBrokersDataClientConfig:
+    def __init__(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        client_id: int | None = None,
+        use_regular_trading_hours: bool | None = None,
+        market_data_type: MarketDataType | None = None,
+        ignore_quote_tick_size_updates: bool | None = None,
+        connection_timeout: int | None = None,
+        request_timeout: int | None = None,
+        handle_revised_bars: bool | None = None,
+    ) -> None: ...
+    @property
+    def host(self) -> str: ...
+    @property
+    def port(self) -> int: ...
+    @property
+    def client_id(self) -> int: ...
+    @property
+    def use_regular_trading_hours(self) -> bool: ...
+    @property
+    def market_data_type(self) -> MarketDataType: ...
+    @property
+    def ignore_quote_tick_size_updates(self) -> bool: ...
+    @property
+    def connection_timeout(self) -> int: ...
+    @property
+    def request_timeout(self) -> int: ...
+    @property
+    def handle_revised_bars(self) -> bool: ...
+
+class InteractiveBrokersExecClientConfig:
+    def __init__(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        client_id: int | None = None,
+        connection_timeout: int | None = None,
+        fetch_all_open_orders: bool | None = None,
+        track_option_exercise_from_position_update: bool | None = None,
+    ) -> None: ...
+    @property
+    def host(self) -> str: ...
+    @property
+    def port(self) -> int: ...
+    @property
+    def client_id(self) -> int: ...
+    @property
+    def connection_timeout(self) -> int: ...
+    @property
+    def fetch_all_open_orders(self) -> bool: ...
+    @property
+    def track_option_exercise_from_position_update(self) -> bool: ...
+
+class InteractiveBrokersInstrumentProviderConfig:
+    def __init__(self) -> None: ...
+    @property
+    def min_expiry_days(self) -> int | None: ...
+    @property
+    def max_expiry_days(self) -> int | None: ...
+    @property
+    def build_options_chain(self) -> bool | None: ...
+    @property
+    def build_futures_chain(self) -> bool | None: ...
+    @property
+    def cache_validity_days(self) -> int | None: ...
+    @property
+    def convert_exchange_to_mic_venue(self) -> bool: ...
+    @property
+    def symbol_to_mic_venue(self) -> dict[str, str]: ...
+    @property
+    def filter_sec_types(self) -> list[str]: ...
+    @property
+    def cache_path(self) -> str | None: ...
+    @cache_path.setter
+    def cache_path(self, cache_path: str | None) -> None: ...
+
+class DockerizedIBGatewayConfig:
+    def __init__(
+        self,
+        username: str | None = None,
+        password: str | None = None,
+        trading_mode: TradingMode | None = None,
+        read_only_api: bool | None = None,
+        timeout: int | None = None,
+        container_image: str | None = None,
+        vnc_port: int | None = None,
+    ) -> None: ...
+    @property
+    def username(self) -> str | None: ...
+    @property
+    def password(self) -> str | None: ...
+    @property
+    def trading_mode(self) -> TradingMode: ...
+    @property
+    def read_only_api(self) -> bool: ...
+    @property
+    def timeout(self) -> int: ...
+    @property
+    def container_image(self) -> str: ...
+    @property
+    def vnc_port(self) -> int | None: ...
+
+class ContainerStatus:
+    NoContainer: int = 1
+    ContainerCreated: int = 2
+    ContainerStarting: int = 3
+    ContainerStopped: int = 4
+    NotLoggedIn: int = 5
+    Ready: int = 6
+    Unknown: int = 7
+
+class DockerizedIBGateway:
+    def __init__(self, config: DockerizedIBGatewayConfig) -> None: ...
+    @property
+    def container_name(self) -> str: ...
+    @property
+    def host(self) -> str: ...
+    @property
+    def port(self) -> int: ...
+    async def start(self, wait: int | None = None) -> None: ...
+    async def safe_start(self, wait: int | None = None) -> None: ...
+    async def stop(self) -> None: ...
+    async def container_status(self) -> ContainerStatus: ...
+
+class InteractiveBrokersDataClient:
+    @property
+    def client_id(self) -> ClientId: ...
+    @property
+    def is_connected(self) -> bool: ...
+    @property
+    def is_disconnected(self) -> bool: ...
+    def get_instrument_provider(self) -> InteractiveBrokersInstrumentProvider: ...
+    async def batch_load(self, instrument_ids: list[InstrumentId]) -> int: ...
+    async def fetch_option_chain_by_range(
+        self,
+        underlying_symbol: str,
+        exchange: str | None = None,
+        currency: str | None = None,
+        expiry_min: str | None = None,
+        expiry_max: str | None = None,
+    ) -> int: ...
+    async def fetch_futures_chain(
+        self,
+        symbol: str,
+        exchange: str | None = None,
+        currency: str | None = None,
+    ) -> int: ...
+    def subscribe_quotes(
+        self,
+        instrument_id: InstrumentId,
+        params: dict[str, str] | None = None,
+    ) -> None: ...
+    def subscribe_trades(self, instrument_id: InstrumentId) -> None: ...
+    def subscribe_bars(self, bar_type: BarType) -> None: ...
+    def subscribe_book_deltas(
+        self,
+        instrument_id: InstrumentId,
+        depth: int | None = None,
+        params: dict[str, str] | None = None,
+    ) -> None: ...
+    def unsubscribe_quotes(self, instrument_id: InstrumentId) -> None: ...
+    def unsubscribe_trades(self, instrument_id: InstrumentId) -> None: ...
+    def unsubscribe_bars(self, bar_type: BarType) -> None: ...
+    def unsubscribe_book_deltas(self, instrument_id: InstrumentId) -> None: ...
+    def request_quotes(
+        self,
+        instrument_id: InstrumentId,
+        limit: int | None = None,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> None: ...
+    def request_trades(
+        self,
+        instrument_id: InstrumentId,
+        limit: int | None = None,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> None: ...
+    def request_bars(
+        self,
+        bar_type: BarType,
+        limit: int | None = None,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> None: ...
+    def request_instrument(
+        self,
+        instrument_id: InstrumentId,
+        params: dict[str, str] | None = None,
+    ) -> None: ...
+    def request_instruments(
+        self,
+        venue: Venue | None = None,
+        params: dict[str, str] | None = None,
+    ) -> None: ...
+    def load_async(
+        self,
+        instrument_id: InstrumentId,
+        force_instrument_update: bool,
+    ) -> Awaitable[None]: ...
+    def load_with_return_async(
+        self,
+        instrument_id: InstrumentId,
+        force_instrument_update: bool,
+    ) -> Awaitable[InstrumentId | None]: ...
+    def load_ids_async(
+        self,
+        instrument_ids: list[InstrumentId],
+        force_instrument_update: bool,
+    ) -> Awaitable[None]: ...
+    def load_ids_with_return_async(
+        self,
+        instrument_ids: list[InstrumentId],
+        force_instrument_update: bool,
+    ) -> Awaitable[list[InstrumentId]]: ...
+    def load_all_async(
+        self,
+        instrument_ids: list[InstrumentId] | None = None,
+        contracts: list[dict[str, Any]] | None = None,
+        force_instrument_update: bool = False,
+    ) -> Awaitable[list[InstrumentId]]: ...
+    def fetch_spread_instrument(
+        self,
+        spread_instrument_id: InstrumentId,
+        force_instrument_update: bool,
+    ) -> Awaitable[bool]: ...
+    def get_instrument_id_by_contract_id(self, contract_id: int) -> InstrumentId | None: ...
+    def instrument_id_to_ib_contract_details(
+        self,
+        instrument_id: InstrumentId,
+    ) -> dict[str, Any] | None: ...
+    def determine_venue(self, contract: dict[str, Any]) -> str: ...
+    def get_instrument(self, contract: dict[str, Any]) -> Instrument | None: ...
+
+class InteractiveBrokersExecutionClient:
+    @property
+    def client_id(self) -> ClientId: ...
+    @property
+    def is_connected(self) -> bool: ...
+    @property
+    def is_disconnected(self) -> bool: ...
+    def submit_order(
+        self, order: Any, instrument_id: InstrumentId, strategy_id: StrategyId
+    ) -> None: ...
+    def submit_order_list(self, orders: Any, strategy_id: StrategyId) -> None: ...
+    def modify_order(
+        self,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        instrument_id: InstrumentId,
+        quantity: Quantity | None = None,
+        price: Price | None = None,
+        trigger_price: Price | None = None,
+    ) -> None: ...
+    def cancel_order(
+        self,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        instrument_id: InstrumentId,
+    ) -> None: ...
+    def cancel_all_orders(self, instrument_id: InstrumentId) -> None: ...
+    def batch_cancel_orders(self, client_order_ids: list[ClientOrderId]) -> None: ...
+    async def generate_order_status_report(
+        self,
+        client_order_id: ClientOrderId,
+    ) -> OrderStatusReport | None: ...
+    async def generate_order_status_reports(
+        self,
+        instrument_id: InstrumentId | None = None,
+    ) -> list[OrderStatusReport]: ...
+    async def generate_fill_reports(
+        self,
+        instrument_id: InstrumentId | None = None,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> list[FillReport]: ...
+    async def generate_position_status_reports(
+        self,
+        instrument_id: InstrumentId | None = None,
+    ) -> list[PositionStatusReport]: ...
+
+class HistoricalInteractiveBrokersClient:
+    async def request_bars(
+        self,
+        bar_specifications: list[str],
+        end_date_time: dt.datetime,
+        start_date_time: dt.datetime | None = None,
+        duration: str | None = None,
+        contracts: list[dict[str, Any]] | None = None,
+        instrument_ids: list[InstrumentId] | None = None,
+        use_rth: bool = True,
+        timeout: int = 60,
+    ) -> list[Bar]: ...
+    async def request_ticks(
+        self,
+        tick_type: str,
+        start_date_time: dt.datetime,
+        end_date_time: dt.datetime,
+        contracts: list[dict[str, Any]] | None = None,
+        instrument_ids: list[InstrumentId] | None = None,
+        use_rth: bool = True,
+        timeout: int = 60,
+    ) -> list[Data]: ...
+    async def request_instruments(
+        self,
+        instrument_ids: list[InstrumentId] | None = None,
+        contracts: list[dict[str, Any]] | None = None,
+    ) -> list[Instrument]: ...
+
+class InteractiveBrokersInstrumentProvider:
+    def __init__(self, config: InteractiveBrokersInstrumentProviderConfig) -> None: ...
+    def find(self, instrument_id: InstrumentId) -> Instrument | None: ...
+    def find_by_contract_id(self, contract_id: int) -> Instrument | None: ...
+    def get_all(self) -> list[Instrument]: ...
+    def count(self) -> int: ...
+    def get_price_magnifier(self, instrument_id: InstrumentId) -> int: ...
+    def fetch_contract_details(self) -> None: ...
+    async def batch_load(self, instrument_ids: list[InstrumentId]) -> int: ...
+    async def fetch_option_chain_by_range(
+        self,
+        underlying_symbol: str,
+        expiry_min: str | None = None,
+        expiry_max: str | None = None,
+    ) -> int: ...
+    async def fetch_futures_chain(
+        self,
+        underlying_symbol: str,
+        expiry_min: str | None = None,
+        expiry_max: str | None = None,
+    ) -> int: ...
+    async def fetch_bag_contract(self, bag_contract: str) -> None: ...
+    async def save_cache(self, cache_path: str) -> None: ...
+    async def load_cache(self, cache_path: str) -> bool: ...
+
 # Greeks
 
 class BlackScholesGreeksResult:
@@ -9822,6 +10201,30 @@ def adjust_fills_for_partial_window(
     instrument: Any,  # PyO3 InstrumentAny
     tolerance: str | None = None,
 ) -> tuple[dict[str, OrderStatusReport], dict[str, list[FillReport]]]: ...
+def create_inferred_reconciliation_trade_id(
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId | None,
+    order_side: OrderSide,
+    order_type: OrderType,
+    filled_qty: Quantity,
+    last_qty: Quantity,
+    last_px: Price,
+    position_id: PositionId,
+    ts_last: int,
+) -> TradeId: ...
+def create_position_reconciliation_venue_order_id(
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    order_side: OrderSide,
+    order_type: OrderType,
+    quantity: Quantity,
+    price: Price | None = None,
+    venue_position_id: PositionId | None = None,
+    ts_last: int = 0,
+    tag: str | None = None,
+) -> VenueOrderId: ...
 
 ###################################################################################################
 # Test Kit

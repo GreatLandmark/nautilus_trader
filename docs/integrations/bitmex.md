@@ -369,6 +369,32 @@ See the [BitMEX Exchange Rules](https://www.bitmex.com/exchange-rules) and [API 
 | Order status updates | ✓         | Real‑time order state changes via WebSocket. |
 | Trade history        | ✓         | Execution and fill reports.                  |
 
+### Liquidation and ADL handling
+
+BitMEX surfaces forced-close fills through the `execType` field on the
+`execution` channel:
+
+| `execType`    | Meaning                                                      |
+|---------------|--------------------------------------------------------------|
+| `Trade`       | Normal execution (user or taker‑initiated).                  |
+| `Liquidation` | Position was force‑closed by the liquidation engine. BitMEX uses this code for both auto‑deleveraging and counterparty liquidation fills. |
+| `Bankruptcy`  | Account bankruptcy; position closed against the insurance fund. |
+| `Settlement`  | Scheduled contract settlement.                               |
+| `Funding`     | Funding settlement on open positions.                        |
+
+The adapter routes `Liquidation` and `Bankruptcy` through the standard
+`FillReport` path and logs a warning on bankruptcy executions. BitMEX's public
+API does **not** distinguish auto-deleveraging from counterparty liquidation
+in `execType`; both appear as `Liquidation`. An ADL-closed position can
+usually be identified by zero commission and the absence of a matching order
+in the local cache (the engine creates an external order for it).
+
+Upstream references:
+
+- [`/execution` field definitions](https://support.bitmex.com/hc/en-gb/articles/6205689858077--execution-field-definitions)
+- [Auto-Deleveraging overview](https://support.bitmex.com/hc/en-gb/articles/18589621443357-What-is-Auto-Deleveraging)
+- [Liquidation overview](https://support.bitmex.com/hc/en-gb/articles/360003188434-Liquidations)
+
 ## Market data
 
 - Order book deltas: `L2_MBP` only; `depth` 0 (full book) or 25.
@@ -383,6 +409,15 @@ See the [BitMEX Exchange Rules](https://www.bitmex.com/exchange-rules) and [API 
 BitMEX caps each REST response at 1,000 rows and requires manual pagination via `start`/`startTime`. The current adapter returns only the
 first page; wider pagination support is scheduled for a future update.
 :::
+
+### Trade ID derivation
+
+Trade ticks and fills use the venue-provided `trdMatchID` (UUID) as the
+`TradeId`. When the venue omits `trdMatchID` (bucketed trades or certain
+execution types), the execution path falls back to the venue's `execID`; market
+data parsers fall back to a deterministic FNV-1a hash of the symbol,
+`ts_event`, price, size, and side. The same venue event yields the same trade
+ID across replays, keeping downstream dedup intact.
 
 ## Connection management
 

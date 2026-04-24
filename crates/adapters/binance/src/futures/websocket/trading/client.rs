@@ -34,7 +34,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use nautilus_common::live::get_runtime;
-use nautilus_core::string::REDACTED;
+use nautilus_core::string::secret::REDACTED;
 use nautilus_network::{
     mode::ConnectionMode,
     ratelimiter::quota::Quota,
@@ -352,24 +352,6 @@ impl BinanceFuturesWsTradingClient {
     ) -> BinanceFuturesWsApiResult<()> {
         let cmd = BinanceFuturesWsTradingCommand::ModifyOrder { id, params };
         self.send_cmd(cmd).await
-    }
-
-    /// Cancels all open orders for a symbol via the WebSocket Trading API.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the handler is unavailable.
-    pub async fn cancel_all_orders(
-        &self,
-        symbol: impl Into<String>,
-    ) -> BinanceFuturesWsApiResult<String> {
-        let id = self.next_request_id();
-        let cmd = BinanceFuturesWsTradingCommand::CancelAllOrders {
-            id: id.clone(),
-            symbol: symbol.into(),
-        };
-        self.send_cmd(cmd).await?;
-        Ok(id)
     }
 
     /// Receives the next message from the handler.

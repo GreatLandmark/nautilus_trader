@@ -13,8 +13,12 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+from __future__ import annotations
+
+import hashlib
 import time
 from decimal import Decimal
+from typing import TYPE_CHECKING
 from typing import Any
 
 import pandas as pd
@@ -25,7 +29,6 @@ from nautilus_trader.adapters.polymarket.common.enums import PolymarketOrderStat
 from nautilus_trader.adapters.polymarket.common.enums import PolymarketOrderType
 from nautilus_trader.adapters.polymarket.common.symbol import get_polymarket_instrument_id
 from nautilus_trader.adapters.polymarket.common.symbol import get_polymarket_token_id
-from nautilus_trader.adapters.polymarket.schemas.book import PolymarketTickSizeChange
 from nautilus_trader.model.currencies import USDC_POS
 from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.enums import LiquiditySide
@@ -38,6 +41,59 @@ from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
+
+
+if TYPE_CHECKING:
+    from nautilus_trader.adapters.polymarket.schemas.book import PolymarketTickSizeChange
+
+
+def determine_trade_id(
+    asset_id: str,
+    side: PolymarketOrderSide,
+    price: str,
+    size: str,
+    timestamp: str,
+) -> TradeId:
+    """
+    Derive a deterministic `TradeId` for a Polymarket market data trade.
+
+    Polymarket does not publish a trade ID with `last_trade_price` events, so we
+    derive one from the trade's identifying fields. Using blake2b with a 0x1f
+    delimiter prevents variable-length fields from colliding (e.g. "0.12" + "34"
+    vs "0.1" + "234").
+
+    Parameters
+    ----------
+    asset_id : str
+        The Polymarket asset (token) ID.
+    side : PolymarketOrderSide
+        The aggressor side of the trade.
+    price : str
+        The trade price as sent by the venue.
+    size : str
+        The trade size as sent by the venue.
+    timestamp : str
+        The trade timestamp as sent by the venue (milliseconds since epoch).
+
+    Returns
+    -------
+    TradeId
+
+    """
+    side_byte = b"B" if side == PolymarketOrderSide.BUY else b"S"
+    digest = hashlib.blake2b(digest_size=8)
+    digest.update(
+        b"\x1f".join(
+            (
+                asset_id.encode(),
+                side_byte,
+                price.encode(),
+                size.encode(),
+                timestamp.encode(),
+            ),
+        ),
+    )
+    return TradeId(digest.hexdigest())
 
 
 def make_composite_trade_id(trade_id: str, venue_order_id: VenueOrderId) -> TradeId:
@@ -159,7 +215,10 @@ def parse_polymarket_instrument(
     raw_symbol = Symbol(get_polymarket_token_id(instrument_id))
     description = market_info["question"]
     price_increment = Price.from_str(str(market_info["minimum_tick_size"]))
-    min_quantity = Quantity.from_int(int(market_info["minimum_order_size"]))
+    # Polymarket exposes `orderMinSize` (limit-order minimum shares) and a separate
+    # $1 market-order minimum amount; the instrument model can only carry one
+    # `min_quantity`, so leave it unset and let the venue reject out-of-bounds orders.
+    # The raw `orderMinSize` remains accessible via `instrument.info`.
     # size_increment can be 0.01 or 0.001 (precision 2 or 3). Need to determine a reliable solution
     # trades are reported with USDC.e increments though - so we use that here
     size_increment = Quantity.from_str("0.000001")
@@ -189,7 +248,7 @@ def parse_polymarket_instrument(
         activation_ns=0,  # TBD?
         expiration_ns=expiration_ns,
         max_quantity=None,
-        min_quantity=min_quantity,
+        min_quantity=None,
         maker_fee=maker_fee,
         taker_fee=taker_fee,
         ts_event=ts_init,
@@ -219,7 +278,7 @@ def update_instrument(
         activation_ns=instrument.activation_ns,
         expiration_ns=instrument.expiration_ns,
         max_quantity=None,
-        min_quantity=instrument.min_quantity,
+        min_quantity=None,
         maker_fee=instrument.maker_fee,
         taker_fee=instrument.taker_fee,
         ts_event=ts_init,

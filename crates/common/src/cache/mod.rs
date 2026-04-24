@@ -49,8 +49,8 @@ use nautilus_core::{
 use nautilus_model::{
     accounts::{Account, AccountAny},
     data::{
-        Bar, BarType, FundingRateUpdate, GreeksData, IndexPriceUpdate, MarkPriceUpdate, QuoteTick,
-        TradeTick, YieldCurveData, option_chain::OptionGreeks,
+        Bar, BarType, FundingRateUpdate, GreeksData, IndexPriceUpdate, InstrumentStatus,
+        MarkPriceUpdate, QuoteTick, TradeTick, YieldCurveData, option_chain::OptionGreeks,
     },
     enums::{AggregationSource, OmsType, OrderSide, PositionSide, PriceType, TriggerType},
     identifiers::{
@@ -91,6 +91,7 @@ pub struct Cache {
     mark_prices: AHashMap<InstrumentId, VecDeque<MarkPriceUpdate>>,
     index_prices: AHashMap<InstrumentId, VecDeque<IndexPriceUpdate>>,
     funding_rates: AHashMap<InstrumentId, VecDeque<FundingRateUpdate>>,
+    instrument_statuses: AHashMap<InstrumentId, VecDeque<InstrumentStatus>>,
     bars: AHashMap<BarType, VecDeque<Bar>>,
     greeks: AHashMap<InstrumentId, GreeksData>,
     option_greeks: AHashMap<InstrumentId, OptionGreeks>,
@@ -99,7 +100,7 @@ pub struct Cache {
     orders: AHashMap<ClientOrderId, OrderAny>,
     order_lists: AHashMap<OrderListId, OrderList>,
     positions: AHashMap<PositionId, Position>,
-    position_snapshots: AHashMap<PositionId, Bytes>,
+    position_snapshots: AHashMap<PositionId, Vec<Bytes>>,
     #[cfg(feature = "defi")]
     pub(crate) defi: crate::defi::cache::DefiCache,
 }
@@ -121,6 +122,7 @@ impl Debug for Cache {
             .field("mark_prices", &self.mark_prices)
             .field("index_prices", &self.index_prices)
             .field("funding_rates", &self.funding_rates)
+            .field("instrument_statuses", &self.instrument_statuses)
             .field("bars", &self.bars)
             .field("greeks", &self.greeks)
             .field("option_greeks", &self.option_greeks)
@@ -167,6 +169,7 @@ impl Cache {
             mark_prices: AHashMap::new(),
             index_prices: AHashMap::new(),
             funding_rates: AHashMap::new(),
+            instrument_statuses: AHashMap::new(),
             bars: AHashMap::new(),
             greeks: AHashMap::new(),
             option_greeks: AHashMap::new(),
@@ -1283,6 +1286,7 @@ impl Cache {
         self.mark_prices.clear();
         self.index_prices.clear();
         self.funding_rates.clear();
+        self.instrument_statuses.clear();
         self.bars.clear();
         self.accounts.clear();
         self.orders.clear();
@@ -1473,6 +1477,26 @@ impl Cache {
         for funding_rate in funding_rates {
             funding_rate_deque.push_front(*funding_rate);
         }
+        Ok(())
+    }
+
+    /// Adds the `instrument_status` update to the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisting the instrument status to the backing database fails.
+    pub fn add_instrument_status(&mut self, status: InstrumentStatus) -> anyhow::Result<()> {
+        log::debug!("Adding `InstrumentStatus` for {}", status.instrument_id);
+
+        if self.config.save_market_data {
+            // TODO: Placeholder and return Result for consistency
+        }
+
+        let statuses_deque = self
+            .instrument_statuses
+            .entry(status.instrument_id)
+            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+        statuses_deque.push_front(status);
         Ok(())
     }
 
@@ -2212,16 +2236,10 @@ impl Cache {
         // Serialize the position (TODO: temporarily just to JSON to remove a dependency)
         let position_serialized = serde_json::to_vec(&copied_position)?;
 
-        let snapshots: Option<&Bytes> = self.position_snapshots.get(&position_id);
-        let new_snapshots = match snapshots {
-            Some(existing_snapshots) => {
-                let mut combined = existing_snapshots.to_vec();
-                combined.extend(position_serialized);
-                Bytes::from(combined)
-            }
-            None => Bytes::from(position_serialized),
-        };
-        self.position_snapshots.insert(position_id, new_snapshots);
+        self.position_snapshots
+            .entry(position_id)
+            .or_default()
+            .push(Bytes::from(position_serialized));
 
         log::debug!("Snapshot {copied_position}");
         Ok(())
@@ -2277,10 +2295,83 @@ impl Cache {
         }
     }
 
-    /// Gets position snapshot bytes for the `position_id`.
+    /// Gets the serialized position snapshot frames for the `position_id`.
+    ///
+    /// Each element in the returned vector is one JSON-encoded [`Position`] snapshot,
+    /// in the order they were taken.
     #[must_use]
-    pub fn position_snapshot_bytes(&self, position_id: &PositionId) -> Option<Vec<u8>> {
-        self.position_snapshots.get(position_id).map(|b| b.to_vec())
+    pub fn position_snapshot_bytes(&self, position_id: &PositionId) -> Option<Vec<Vec<u8>>> {
+        self.position_snapshots
+            .get(position_id)
+            .map(|frames| frames.iter().map(|b| b.to_vec()).collect())
+    }
+
+    /// Returns the number of stored snapshot frames for the `position_id`.
+    ///
+    /// Returns `0` when no frames are stored. Does not allocate or copy frame bytes.
+    #[must_use]
+    pub fn position_snapshot_count(&self, position_id: &PositionId) -> usize {
+        self.position_snapshots.get(position_id).map_or(0, Vec::len)
+    }
+
+    /// Returns all position snapshots with the given optional filters.
+    ///
+    /// When `position_id` is `Some`, only snapshots for that position are returned.
+    /// When `account_id` is `Some`, snapshots are filtered to that account.
+    /// Frames that fail to deserialize are skipped with a warning.
+    #[must_use]
+    pub fn position_snapshots(
+        &self,
+        position_id: Option<&PositionId>,
+        account_id: Option<&AccountId>,
+    ) -> Vec<Position> {
+        let frames: Box<dyn Iterator<Item = &Bytes> + '_> = match position_id {
+            Some(pid) => match self.position_snapshots.get(pid) {
+                Some(v) => Box::new(v.iter()),
+                None => Box::new(std::iter::empty()),
+            },
+            None => Box::new(self.position_snapshots.values().flat_map(|v| v.iter())),
+        };
+
+        let mut results: Vec<Position> = frames
+            .filter_map(|bytes| match serde_json::from_slice::<Position>(bytes) {
+                Ok(position) => Some(position),
+                Err(e) => {
+                    log::warn!("Failed to decode position snapshot: {e}");
+                    None
+                }
+            })
+            .collect();
+
+        if let Some(aid) = account_id {
+            results.retain(|p| p.account_id == *aid);
+        }
+
+        results
+    }
+
+    /// Returns position snapshots for `position_id` starting from the `skip`th frame.
+    ///
+    /// Use this to deserialize only newly appended snapshots when the caller already
+    /// processed earlier frames. Returns an empty vector when no frames or fewer than
+    /// `skip` frames are stored. Frames that fail to deserialize are skipped with a warning.
+    #[must_use]
+    pub fn position_snapshots_from(&self, position_id: &PositionId, skip: usize) -> Vec<Position> {
+        let Some(frames) = self.position_snapshots.get(position_id) else {
+            return Vec::new();
+        };
+
+        frames
+            .iter()
+            .skip(skip)
+            .filter_map(|bytes| match serde_json::from_slice::<Position>(bytes) {
+                Ok(position) => Some(position),
+                Err(e) => {
+                    log::warn!("Failed to decode position snapshot: {e}");
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Gets position snapshot IDs for the `instrument_id`.
@@ -3427,6 +3518,17 @@ impl Cache {
             .map(|funding_rates| funding_rates.iter().copied().collect())
     }
 
+    /// Gets all instrument status updates for the `instrument_id`.
+    #[must_use]
+    pub fn instrument_statuses(
+        &self,
+        instrument_id: &InstrumentId,
+    ) -> Option<Vec<InstrumentStatus>> {
+        self.instrument_statuses
+            .get(instrument_id)
+            .map(|statuses| statuses.iter().copied().collect())
+    }
+
     /// Gets all bars for the `bar_type`.
     #[must_use]
     pub fn bars(&self, bar_type: &BarType) -> Option<Vec<Bar>> {
@@ -3520,6 +3622,14 @@ impl Cache {
         self.funding_rates
             .get(instrument_id)
             .and_then(|funding_rates| funding_rates.front())
+    }
+
+    /// Gets a reference to the latest instrument status update for the `instrument_id`.
+    #[must_use]
+    pub fn instrument_status(&self, instrument_id: &InstrumentId) -> Option<&InstrumentStatus> {
+        self.instrument_statuses
+            .get(instrument_id)
+            .and_then(|statuses| statuses.front())
     }
 
     /// Gets a reference to the latest bar for the `bar_type`.

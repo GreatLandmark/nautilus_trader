@@ -251,6 +251,37 @@ For full protocol details, see the Hyperliquid docs:
 - [Asset IDs](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/asset-ids)
 - [Fees](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees)
 
+### Wildcard character sanitization
+
+Some HIP-3 dexes deploy assets whose venue names contain `*` or `?` bytes
+(for example `dex:STREAMABCD****-USD-PERP`). Those bytes collide with the
+Nautilus message bus pattern syntax (`*` = zero-or-more, `?` = one-char) and
+would corrupt subscription routing if embedded in topic strings unchanged.
+
+The Hyperliquid adapter substitutes both bytes with `x` when constructing the
+`InstrumentId.symbol`, so a HIP-3 asset named `dex:STREAMABCD****` is exposed
+to strategies as:
+
+```python
+InstrumentId.from_str("dex:STREAMABCDxxxx-USD-PERP.HYPERLIQUID")
+```
+
+The substitution applies only to the Nautilus-internal symbol used in topics,
+caches, logs, and config. The venue-official name is preserved on the
+instrument's `raw_symbol` field for HTTP and WebSocket wire calls, and order
+submissions reference the numeric asset index, so the round-trip with
+Hyperliquid is unaffected.
+
+When subscribing to a HIP-3 instrument with wildcard bytes in its venue name,
+use the sanitized form. Symbols without `*` or `?` are passed through
+unchanged.
+
+The substitution is lossy: two distinct venue names such as `dex:FOO*` and
+`dex:FOO?` would normalize onto the same Nautilus symbol. The instrument
+loader detects collisions, keeps the first definition, and logs a warning
+with the dropped venue name; the dropped instrument will not be tradeable
+through Nautilus until the venue rename resolves the collision.
+
 ## Instrument provider
 
 The instrument provider supports filtering when loading instruments via
@@ -277,19 +308,40 @@ instrument_provider=InstrumentProviderConfig(
 The adapter supports the following data subscriptions. All perpetual data types
 (mark prices, index prices, funding rates) apply to both standard and HIP-3 perps.
 
-| Data type         | Subscription | Snapshot | Historical | Nautilus type        | Notes                                      |
-|-------------------|--------------|----------|------------|----------------------|--------------------------------------------|
-| Trade ticks       | ✓            | -        | -          | `TradeTick`          | Via WebSocket trades channel.              |
-| Quote ticks       | ✓            | -        | -          | `QuoteTick`          | Best bid/offer from WebSocket.             |
-| Order book deltas | ✓            | ✓        | -          | `OrderBookDelta`     | L2 depth. Each message is a full snapshot. |
-| Bars              | ✓            | -        | ✓          | `Bar`                | See supported intervals below.             |
-| Mark prices       | ✓            | -        | -          | `MarkPriceUpdate`    | Perpetual mark price ticks.                |
-| Index prices      | ✓            | -        | -          | `IndexPriceUpdate`   | Underlying index reference prices.         |
-| Funding rates     | ✓            | -        | -          | `FundingRateUpdate`  | Perpetual funding rate updates.            |
+| Data type         | Subscription | Snapshot | Historical | Nautilus type       | Notes                                      |
+|-------------------|--------------|----------|------------|---------------------|--------------------------------------------|
+| Trade ticks       | ✓            | -        | -          | `TradeTick`         | Via WebSocket trades channel.              |
+| Quote ticks       | ✓            | -        | -          | `QuoteTick`         | Best bid/offer from WebSocket.             |
+| Order book deltas | ✓            | ✓        | -          | `OrderBookDelta`    | L2 depth. Each message is a full snapshot. |
+| Order book depth  | ✓            | -        | -          | `OrderBookDepth10`  | Top-10 L2 snapshots from the `l2Book` feed.|
+| Bars              | ✓            | -        | ✓          | `Bar`               | See supported intervals below.             |
+| Mark prices       | ✓            | -        | -          | `MarkPriceUpdate`   | Perpetual mark price ticks.                |
+| Index prices      | ✓            | -        | -          | `IndexPriceUpdate`  | Underlying index reference prices.         |
+| Funding rates     | ✓            | -        | ✓          | `FundingRateUpdate` | `fundingHistory` info endpoint.            |
 
 :::note
-Historical quote tick and trade tick requests are not yet supported by this adapter.
+Historical quote and trade requests are not supported. Hyperliquid does not publish
+a public trade-tape endpoint; real-time trades are available via the WebSocket
+`trades` channel. `request_trades` returns an explicit error.
 :::
+
+### Order book precision controls
+
+The `l2Book` subscription accepts optional `nSigFigs` and `mantissa` parameters
+that thin the venue-side book aggregation. The adapter forwards them when
+passed through `subscribe_params` on book deltas and depth subscriptions:
+
+```python
+from nautilus_trader.model.data import BookType
+
+self.subscribe_order_book_deltas(
+    instrument_id=instrument_id,
+    book_type=BookType.L2_MBP,
+    params={"n_sig_figs": 5, "mantissa": 2},
+)
+```
+
+Omitting both params subscribes to the full-depth book.
 
 ### Supported bar intervals
 
@@ -322,14 +374,14 @@ instructions apply to both.
 
 ### Order types
 
-| Order Type          | Perpetuals | Spot | Notes                                     |
-|---------------------|------------|------|-------------------------------------------|
-| `MARKET`            | ✓          | ✓    | IOC limit at 0.5% slippage from best BBO. |
-| `LIMIT`             | ✓          | ✓    |                                           |
-| `STOP_MARKET`       | ✓          | ✓    | Stop loss orders.                         |
-| `STOP_LIMIT`        | ✓          | ✓    | Stop loss with limit execution.           |
-| `MARKET_IF_TOUCHED` | ✓          | ✓    | Take profit at market.                    |
-| `LIMIT_IF_TOUCHED`  | ✓          | ✓    | Take profit with limit execution.         |
+| Order Type          | Perpetuals | Spot | Notes                                                       |
+|---------------------|------------|------|-------------------------------------------------------------|
+| `MARKET`            | ✓          | ✓    | IOC limit with configurable slippage from best BBO.         |
+| `LIMIT`             | ✓          | ✓    |                                                             |
+| `STOP_MARKET`       | ✓          | ✓    | Stop loss orders.                                           |
+| `STOP_LIMIT`        | ✓          | ✓    | Stop loss with limit execution.                             |
+| `MARKET_IF_TOUCHED` | ✓          | ✓    | Take profit at market.                                      |
+| `LIMIT_IF_TOUCHED`  | ✓          | ✓    | Take profit with limit execution.                           |
 
 :::info
 Conditional orders (stop and if-touched) are implemented using Hyperliquid's native trigger
@@ -339,16 +391,21 @@ against the [mark price](https://hyperliquid.gitbook.io/hyperliquid-docs/trading
 
 :::note
 Market orders require cached quote data. The adapter uses the best ask (for buys) or best bid
-(for sells) with 0.5% slippage. Prices are rounded to 5 significant figures, which is a
-Hyperliquid API requirement for all limit prices. Ensure you subscribe to quotes for any
-instrument you intend to trade with market orders.
+(for sells) with a configurable slippage buffer (default 50 bps). Prices are rounded to 5
+significant figures, which is a Hyperliquid API requirement for all limit prices. Ensure you
+subscribe to quotes for any instrument you intend to trade with market orders.
+
+The slippage buffer is controlled by `market_order_slippage_bps` on
+`HyperliquidExecClientConfig` and can be overridden per-order via the
+`market_order_slippage_bps` key in `SubmitOrder.params`.
 :::
 
 :::note
 `STOP_MARKET` and `MARKET_IF_TOUCHED` orders do not carry a limit price. The adapter derives
-one from the trigger price with 0.5% slippage, rounds to 5 significant figures, and clamps to
-the instrument's price precision (ceiling for buys, floor for sells). This guarantees
-Hyperliquid's `limit_px >= trigger_px` (buys) / `limit_px <= trigger_px` (sells) constraint.
+one from the trigger price with the same configurable slippage buffer (default 50 bps), rounds
+to 5 significant figures, and clamps to the instrument's price precision (ceiling for buys,
+floor for sells). This guarantees Hyperliquid's `limit_px >= trigger_px` (buys) /
+`limit_px <= trigger_px` (sells) constraint.
 :::
 
 :::warning
@@ -404,17 +461,19 @@ ALO (Add-Liquidity-Only) lane.
 
 ### Order operations
 
-| Operation         | Perpetuals | Spot | Notes                                           |
-|-------------------|------------|------|-------------------------------------------------|
-| Submit order      | ✓          | ✓    | Single order submission.                        |
-| Submit order list | ✓          | ✓    | Batch order submission (single API call).       |
-| Modify order      | ✓          | ✓    | Requires venue order ID.                        |
-| Cancel order      | ✓          | ✓    | Cancel by client order ID.                      |
-| Cancel all orders | ✓          | ✓    | Iterates cached open orders by instrument/side. |
-| Batch cancel      | ✓          | ✓    | Iterates provided cancel list.                  |
+| Operation         | Perpetuals | Spot | Notes                                                    |
+|-------------------|------------|------|----------------------------------------------------------|
+| Submit order      | ✓          | ✓    | Single order submission.                                 |
+| Submit order list | ✓          | ✓    | Batch order submission (single API call).                |
+| Modify order      | ✓          | ✓    | Requires venue order ID.                                 |
+| Cancel order      | ✓          | ✓    | Cancel by client order ID.                               |
+| Cancel all orders | ✓          | ✓    | Single batched `cancelByCloid` for open orders.          |
+| Batch cancel      | ✓          | ✓    | Single batched `cancelByCloid` for the provided list.    |
 
-:::warning
-Cancel all and batch cancel issue individual cancel requests per order.
+:::info
+When the venue rejects individual orders inside a batch cancel (for example
+`MissingOrder` for an already-terminal order), the adapter emits a per-order
+`OrderCancelRejected` event and leaves the other cancels intact.
 :::
 
 :::info
@@ -517,6 +576,31 @@ Leverage is managed directly through the Hyperliquid web UI or API, not through 
 Set your desired leverage per instrument on Hyperliquid before trading.
 :::
 
+## Liquidation and ADL handling
+
+Hyperliquid signals venue-initiated closures through two WebSocket surfaces on
+the `userEvents` subscription:
+
+- **`liquidation` event**: emitted when an account is liquidated. Carries a
+  `liquidation ID`, liquidator address, liquidated user, liquidated notional
+  position, and liquidated account value. The adapter logs these at warning
+  level for operator visibility.
+- **Fill-level `liquidation` metadata**: each entry in the `fills` array can
+  carry an optional `liquidation` object with `method`, `markPx`, and
+  `liquidatedUser`. The `method` value is either `market` (liquidated into
+  the book) or `backstop` (closed against the backstop vault, the equivalent
+  of an ADL close when the insurance mechanism steps in).
+
+The adapter emits the standard `FillReport` for each liquidation fill. The
+liquidation metadata is logged alongside the fill so you can correlate closures
+to venue-side events. No strategy-side changes are required; existing risk and
+reconciliation logic runs over these fills as for any other TAKER fill.
+
+Upstream references:
+
+- [WebSocket `userEvents` (`liquidation` and `FillLiquidation`)](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions)
+- [Liquidation mechanics](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/liquidations)
+
 ## Connection management
 
 The adapter automatically reconnects on WebSocket disconnection using exponential backoff
@@ -588,21 +672,22 @@ backoff (full jitter) on rate limit (429) and server error (5xx) responses.
 
 ### Execution client configuration options
 
-| Option                   | Default | Description                                                                               |
-|--------------------------|---------|-------------------------------------------------------------------------------------------|
-| `private_key`            | `None`  | EVM private key; loaded from `HYPERLIQUID_PK` or `HYPERLIQUID_TESTNET_PK` when omitted.   |
-| `vault_address`          | `None`  | Vault address; loaded from `HYPERLIQUID_VAULT` or `HYPERLIQUID_TESTNET_VAULT` if omitted. |
-| `account_address`        | `None`  | Main account address for agent wallet trading; loaded from `HYPERLIQUID_ACCOUNT_ADDRESS`. |
-| `base_url_ws`            | `None`  | Override for the WebSocket base URL.                                                      |
-| `testnet`                | `False` | Connect to the Hyperliquid testnet when `True`.                                           |
-| `product_types`          | `None`  | Optional product types to load, for example `PERP_HIP3` for HIP-3 perps.                  |
-| `max_retries`            | `None`  | Maximum retry attempts for submit, cancel, or modify order requests.                      |
-| `retry_delay_initial_ms` | `None`  | Initial delay (milliseconds) between retries.                                             |
-| `retry_delay_max_ms`     | `None`  | Maximum delay (milliseconds) between retries.                                             |
-| `http_timeout_secs`      | `10`    | Timeout (seconds) applied to REST calls.                                                  |
-| `normalize_prices`       | `True`  | Normalize order prices to 5 significant figures before submission.                        |
-| `http_proxy_url`         | `None`  | Optional HTTP proxy URL.                                                                  |
-| `ws_proxy_url`           | `None`  | Reserved; WebSocket proxy not yet implemented.                                            |
+| Option                      | Default | Description                                                                               |
+|-----------------------------|---------|-------------------------------------------------------------------------------------------|
+| `private_key`               | `None`  | EVM private key; loaded from `HYPERLIQUID_PK` or `HYPERLIQUID_TESTNET_PK` when omitted.   |
+| `vault_address`             | `None`  | Vault address; loaded from `HYPERLIQUID_VAULT` or `HYPERLIQUID_TESTNET_VAULT` if omitted. |
+| `account_address`           | `None`  | Main account address for agent wallet trading; loaded from `HYPERLIQUID_ACCOUNT_ADDRESS`. |
+| `base_url_ws`               | `None`  | Override for the WebSocket base URL.                                                      |
+| `testnet`                   | `False` | Connect to the Hyperliquid testnet when `True`.                                           |
+| `product_types`             | `None`  | Optional product types to load, for example `PERP_HIP3` for HIP-3 perps.                  |
+| `max_retries`               | `None`  | Maximum retry attempts for submit, cancel, or modify order requests.                      |
+| `retry_delay_initial_ms`    | `None`  | Initial delay (milliseconds) between retries.                                             |
+| `retry_delay_max_ms`        | `None`  | Maximum delay (milliseconds) between retries.                                             |
+| `http_timeout_secs`         | `10`    | Timeout (seconds) applied to REST calls.                                                  |
+| `normalize_prices`          | `True`  | Normalize order prices to 5 significant figures before submission.                        |
+| `market_order_slippage_bps` | `50`    | Slippage buffer (bps) applied to MARKET and stop trigger derivations.                     |
+| `http_proxy_url`            | `None`  | Optional HTTP proxy URL.                                                                  |
+| `ws_proxy_url`              | `None`  | Reserved; WebSocket proxy not yet implemented.                                            |
 
 ### Configuration example
 
