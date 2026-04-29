@@ -3649,7 +3649,23 @@ impl OrderMatchingEngine {
             // Exhausted simulated book volume (continue aggressive filling into next level)
             // This is a very basic implementation of slipping by a single tick, in the future
             // we will implement more detailed fill modeling.
-            todo!("Exhausted simulated book volume")
+            // todo!("Exhausted simulated book volume")
+            {
+                log::warn!(
+                    "Exhausted simulated book volume for {} - fallback to cancel remaining or partial fill",
+                    order.client_order_id()
+                );
+                // 简单策略：针对 IOC/FOK/普通市价做不同处理；这里示例对开放订单直接取消。
+                if order.time_in_force() == TimeInForce::Ioc
+                    || order.time_in_force() == TimeInForce::Fok
+                {
+                    self.cancel_order(order, None);
+                } else {
+                    // 对于普通市价，直接把剩余量作为已填（或按需要做部分填充/记录）
+                    // 这里选择取消以避免不一致；可替换为部分填充逻辑。
+                    self.cancel_order(order, None);
+                }
+            }
         }
     }
 
